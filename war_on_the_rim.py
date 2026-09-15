@@ -2218,4 +2218,11 @@ def main():
                 else:
                     game.on_key(event.key)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not game.over:
-                game.on_click(event.
+                game.on_click(event.pos)
+        game.update(dt)
+        game.draw(screen, pygame.mouse.get_pos())
+        pygame.display.flip()
+
+
+if __name__ == "__main__":
+    main()
