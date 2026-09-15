@@ -12,10 +12,16 @@ Soldiers earn experience and climb the ranks:
 Each rank adds attack, defence, morale and hit points (and damage and
 spell power at higher ranks). Enemy garrisons gain experience too.
 
+Every unit carries one or more weapons and uses all of its melee weapons
+each round, like Conquest of Elysium. Weapons can have reach, charge, repel,
+sweep, stun, poison, life drain, armour-piercing and more. Hover over any
+unit in battle to see them.
+
 Controls
   Town:   click a plot, use the side panel. M opens the War Map.
+          P (or the Pause button) pauses the town; you can still give orders.
   Map:    click a location, then March. M or ESC returns to town.
-  Battle: SPACE pause, 1/2/3 speed, S skip to the end, ENTER continue.
+  Battle: SPACE or P pause, 1/2/3 speed, S skip to the end, ENTER continue.
   R restarts after victory or defeat.
 
 Requires pygame 2.x  (pip install pygame)
@@ -127,7 +133,7 @@ class Spell:
 SPELLS = {
     "firebolt": Spell("Firebolt", "bolt", 1, 8, 6, "fire", ap=True),
     "fireball": Spell("Fireball", "blast", 4, 7, 6, "fire"),
-    "lightning": Spell("Chain Lightning", "chain", 5, 9, 8, "lightning", ap=True),
+    "lightning": Spell("Chain Lightning", "chain", 5, 9, 7, "lightning", ap=True),
     "entangle": Spell("Entangle", "entangle", 2, 7, style="nature", slow=2),
     "summon_wolf": Spell("Call Wolf", "summon", 4, style="nature", offensive=False),
     "heal": Spell("Heal", "heal", 1, 4, 5, "holy", offensive=False),
@@ -136,6 +142,7 @@ SPELLS = {
     "curse": Spell("Hex", "curse", 2, 7, style="dark"),
     "raise_dead": Spell("Raise Dead", "raise", 3, 6, style="dark", offensive=False),
     "drain": Spell("Grave Bolt", "bolt", 1, 7, 5, "dark", ap=True),
+    "haste": Spell("Haste", "haste", 3, 3, style="lightning", offensive=False),
 }
 
 
@@ -143,18 +150,52 @@ SPELLS = {
 # Units
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
+class Weapon:
+    name: str
+    dmg: int
+    rng: int = 0
+    ammo: int = 0
+    reach: int = 1
+    att: int = 0
+    chance: int = 0
+    tags: tuple = ()
+
+    LONG = {"ap": "armour-piercing", "an": "ignores armour", "charge": "only when charging",
+            "repel": "strikes first vs charges", "sweep": "sweeps a second foe", "poison": "poison",
+            "drain": "drains life", "magic": "magic", "holy": "holy", "thrown": "thrown once",
+            "reload": "slow reload", "anti_mount": "+5 vs riders"}
+    SHORT = {"ap": "AP", "an": "AN", "charge": "charge", "repel": "repel", "sweep": "sweep",
+             "poison": "poison", "drain": "drain", "magic": "magic", "holy": "holy", "thrown": "thrown",
+             "reload": "slow", "anti_mount": "anti-rider", "stun": "stun"}
+
+    def describe(self):
+        bits = [f"range {self.rng}"] if self.rng else []
+        if self.reach > 1:
+            bits.append("reach 2")
+        for t in self.tags:
+            bits.append(f"stun {self.chance}%" if t == "stun" else self.LONG.get(t, t))
+        return f"{self.name} {self.dmg}" + (f" ({', '.join(bits)})" if bits else "")
+
+    def short(self):
+        bits = ([f"r{self.rng}"] if self.rng else []) + (["reach"] if self.reach > 1 else [])
+        bits += [self.SHORT[t] for t in self.tags if t in self.SHORT]
+        return f"{self.name} {self.dmg}" + (f" [{' '.join(bits)}]" if bits else "")
+
+
+Wp = Weapon
+
+
+@dataclass(frozen=True)
 class UnitType:
     key: str
     name: str
     hp: int
     att: int
     defense: int
-    dmg: int
     prot: int
     mor: int
+    weapons: tuple = ()
     move: int = 1
-    rng: int = 0
-    ammo: int = 0
     mana: int = 0
     regen: int = 0
     spells: tuple = ()
@@ -170,82 +211,119 @@ class UnitType:
     tags: tuple = ()
     desc: str = ""
 
+    @property
+    def rng(self):
+        return max((w.rng for w in self.weapons if w.rng and "thrown" not in w.tags), default=0)
+
+    def attack_line(self):
+        s = " · ".join(w.short() for w in self.weapons)
+        if self.spells:
+            s += " · " + ", ".join(SPELLS[k].name for k in self.spells)
+        return s
+
 
 UNITS = {u.key: u for u in [
     # ---- your people ----
-    UnitType("captain", "Captain", 17, 11, 11, 6, 3, 15, glyph="banner", big=True,
-             tags=("commander",), desc="Leads the warband. Allies fight bravely near."),
-    UnitType("militia", "Militia", 9, 8, 8, 4, 1, 8, gold=10, train=4, building="hall",
-             glyph="fork", desc="Cheap levies. Break easily."),
-    UnitType("spearman", "Spearman", 11, 10, 12, 5, 4, 10, gold=18, iron=4, train=6,
-             building="barracks", glyph="spear", tags=("anti_mount",),
-             desc="Steady line. Bonus damage against riders."),
-    UnitType("swordsman", "Swordsman", 13, 12, 12, 7, 6, 11, gold=24, iron=12, train=8,
-             building="barracks", req_level=2, glyph="sword", desc="Armoured veterans who hold the centre."),
-    UnitType("archer", "Archer", 8, 10, 7, 5, 1, 9, rng=9, ammo=10, gold=20, train=6,
-             building="range", glyph="bow", desc="Long range. Stray arrows hit anyone."),
-    UnitType("crossbow", "Crossbowman", 9, 11, 8, 9, 3, 9, rng=8, ammo=8, gold=26, iron=10,
-             train=8, building="range", req_level=2, glyph="xbow", tags=("ap", "reload"),
-             desc="Armour-piercing. Shoots every other round."),
-    UnitType("knight", "Knight", 20, 13, 13, 9, 9, 13, move=2, gold=50, iron=25, train=14,
-             building="stables", glyph="lance", big=True, mounted=True, tags=("charge",),
-             desc="Heavy cavalry. Hits hard on the charge."),
-    UnitType("horse_archer", "Horse Archer", 12, 11, 10, 5, 3, 11, move=2, rng=7, ammo=8,
-             gold=40, iron=10, train=11, building="stables", req_level=2, glyph="hbow",
-             mounted=True, desc="Fast mounted bowman."),
-    UnitType("priest", "Priest", 8, 6, 6, 3, 0, 12, mana=8, regen=1, spells=("heal", "smite"),
-             gold=32, train=10, building="temple", glyph="cross",
-             desc="Heals allies. Smites the undead."),
-    UnitType("paladin", "Paladin", 18, 13, 14, 8, 8, 15, mana=3, regen=1, spells=("bless",),
-             gold=60, iron=30, train=16, building="temple", req_level=2, glyph="shield", big=True,
-             tags=("melee_caster", "holy", "magic_weapon"),
-             desc="Holy knight. Blesses allies, sears undead."),
-    UnitType("apprentice", "Apprentice", 7, 7, 6, 3, 0, 9, mana=8, regen=1, spells=("firebolt",),
-             gold=28, train=8, building="arcanum", glyph="orb",
-             desc="Hurls firebolts that burn through armour."),
-    UnitType("battlemage", "Battle Mage", 9, 8, 7, 3, 0, 11, mana=12, regen=1,
-             spells=("fireball", "firebolt"), gold=48, iron=10, train=12, building="arcanum",
-             req_level=2, glyph="flame", desc="Fireballs hit a 3x3 area. Mind your lines."),
-    UnitType("stormmage", "Storm Mage", 10, 9, 8, 3, 1, 12, mana=15, regen=1,
-             spells=("lightning", "firebolt"), gold=75, iron=20, train=16, building="arcanum",
-             req_level=3, glyph="bolt", desc="Chain lightning leaps between foes."),
-    UnitType("druid", "Druid", 9, 7, 7, 4, 1, 12, mana=10, regen=2,
-             spells=("summon_wolf", "entangle"), gold=38, train=10, building="grove",
-             glyph="leaf", desc="Calls wolves and roots enemies in place."),
-    UnitType("treant", "Treant", 30, 10, 9, 9, 6, 30, gold=65, train=18, building="grove",
-             req_level=2, glyph="tree", big=True, tags=("mindless", "regen"),
-             desc="Living oak. Regrows wounds, never flees."),
-    UnitType("wolf", "Wolf", 10, 10, 9, 5, 1, 9, move=2, glyph="fang", desc="Summoned by a druid."),
-    UnitType("tower", "Tower Archer", 12, 11, 9, 6, 5, 20, rng=10, ammo=12,
+    UnitType("captain", "Captain", 17, 11, 11, 3, 15,
+             (Wp("Longsword", 6), Wp("Shield Bash", 2, chance=25, tags=("stun",))),
+             glyph="banner", big=True, tags=("commander",),
+             desc="Leads the warband. Allies stand firm near."),
+    UnitType("militia", "Militia", 9, 8, 8, 1, 8, (Wp("Pitchfork", 4, reach=2),),
+             gold=10, train=4, building="hall", glyph="fork",
+             desc="Cheap levies. Pitchforks reach past the front."),
+    UnitType("spearman", "Spearman", 11, 10, 12, 4, 10,
+             (Wp("Spear", 5, reach=2, tags=("repel", "anti_mount")),),
+             gold=18, iron=4, train=6, building="barracks", glyph="spear",
+             desc="Holds the line. Stops charges cold."),
+    UnitType("berserker", "Berserker", 13, 11, 8, 1, 12,
+             (Wp("Axe", 5), Wp("Axe", 5)),
+             gold=24, iron=8, train=8, building="barracks", req_level=2, glyph="axe",
+             tags=("frenzy",), desc="Two axes. Wounded: +3 damage, never flees."),
+    UnitType("archer", "Archer", 8, 10, 7, 1, 9,
+             (Wp("Longbow", 5, rng=10, ammo=12), Wp("Dagger", 3)),
+             gold=20, train=6, building="range", glyph="bow",
+             desc="Long range, lots of arrows. Weak up close."),
+    UnitType("crossbow", "Crossbowman", 10, 10, 9, 5, 10,
+             (Wp("Heavy Crossbow", 9, rng=6, ammo=8, tags=("ap", "reload")), Wp("Hatchet", 4)),
+             gold=26, iron=10, train=8, building="range", req_level=2, glyph="xbow",
+             desc="Short range armour-breaker. Slow to reload."),
+    UnitType("knight", "Knight", 20, 12, 13, 9, 13,
+             (Wp("Lance", 9, tags=("charge", "ap")), Wp("Longsword", 6), Wp("Hooves", 3)),
+             move=2, gold=50, iron=25, train=14, building="stables", glyph="lance", big=True,
+             mounted=True, desc="Devastating charge, then sword and hooves."),
+    UnitType("horse_archer", "Horse Archer", 12, 11, 10, 3, 11,
+             (Wp("Shortbow", 5, rng=7, ammo=10), Wp("Sabre", 4)),
+             move=2, gold=40, iron=10, train=11, building="stables", req_level=2, glyph="hbow",
+             mounted=True, tags=("skirmish",), desc="Rides away from melee and keeps shooting."),
+    UnitType("priest", "Priest", 9, 7, 7, 1, 12, (Wp("Mace", 4),),
+             mana=8, regen=1, spells=("heal", "smite"), gold=32, train=10, building="temple",
+             glyph="cross", desc="Heals allies. Smites the undead."),
+    UnitType("paladin", "Paladin", 18, 13, 14, 8, 15,
+             (Wp("Holy Blade", 7, tags=("magic", "holy")), Wp("Shield Bash", 2, chance=25, tags=("stun",))),
+             mana=3, regen=1, spells=("bless",), gold=60, iron=30, train=16, building="temple",
+             req_level=2, glyph="shield", big=True, tags=("melee_caster",),
+             desc="Frontline holy knight. Blesses those beside."),
+    UnitType("apprentice", "Apprentice", 7, 7, 6, 0, 9, (Wp("Dagger", 2),),
+             mana=8, regen=1, spells=("firebolt",), gold=28, train=8, building="arcanum",
+             glyph="orb", desc="Cheap caster. Firebolts burn through armour."),
+    UnitType("battlemage", "Battle Mage", 9, 8, 7, 0, 11, (Wp("Staff", 3),),
+             mana=12, regen=1, spells=("fireball", "firebolt"), gold=48, iron=10, train=12,
+             building="arcanum", req_level=2, glyph="flame",
+             desc="Fireballs scorch a 3x3 area. Mind your lines."),
+    UnitType("stormmage", "Storm Mage", 10, 9, 8, 1, 12, (Wp("Staff", 3),),
+             mana=15, regen=1, spells=("lightning", "haste"), gold=75, iron=20, train=16,
+             building="arcanum", req_level=3, glyph="bolt",
+             desc="Chain lightning. Hastens allies to double move."),
+    UnitType("druid", "Druid", 9, 7, 7, 1, 12, (Wp("Staff", 3),),
+             mana=10, regen=2, spells=("summon_wolf", "entangle"), gold=38, train=10,
+             building="grove", glyph="leaf", desc="Calls wolves and roots enemies in place."),
+    UnitType("treant", "Treant", 30, 10, 9, 6, 30,
+             (Wp("Branches", 8, tags=("sweep",)), Wp("Grasping Roots", 3, chance=30, tags=("stun",))),
+             gold=65, train=18, building="grove", req_level=2, glyph="tree", big=True,
+             tags=("mindless", "regen", "plant"), desc="Sweeping branches. Regrows, never flees."),
+    UnitType("wolf", "Wolf", 10, 10, 9, 1, 9, (Wp("Bite", 5),), move=2, glyph="fang",
+             desc="Summoned by a druid."),
+    UnitType("tower", "Tower Archer", 12, 11, 9, 5, 20, (Wp("Longbow", 6, rng=10, ammo=14),),
              glyph="tower", tags=("static",), desc="Fires from the walls."),
     # ---- Ironveil ----
-    UnitType("raider", "Raider", 9, 10, 8, 7, 2, 9, glyph="axe", desc="Ironveil footman."),
-    UnitType("slinger", "Slinger", 7, 9, 7, 4, 0, 8, rng=7, ammo=12, glyph="sling",
-             desc="Skirmisher with a sling."),
-    UnitType("brute", "Brute", 24, 10, 7, 12, 3, 11, glyph="club", big=True,
-             desc="Huge and brutal."),
-    UnitType("warg", "Warg Rider", 12, 11, 10, 7, 2, 9, move=2, glyph="fang", mounted=True,
-             tags=("charge",), desc="Fast raiders on wolfback."),
-    UnitType("ironguard", "Ironguard", 14, 12, 12, 9, 6, 12, glyph="helm", tags=("ap",),
-             desc="Armoured elite. Maces crush armour."),
-    UnitType("shaman", "Ash Shaman", 9, 8, 6, 3, 0, 10, mana=8, regen=1, spells=("firebolt",),
-             glyph="star", desc="Hurls armour-burning cinders."),
-    UnitType("hexer", "Hexer", 9, 8, 7, 3, 0, 11, mana=10, regen=2, spells=("curse", "firebolt"),
-             glyph="eye", desc="Hexes your best fighters."),
-    UnitType("warlord", "Warlord", 34, 15, 13, 12, 9, 16, glyph="crown", big=True,
-             tags=("commander",), desc="Master of Ironveil."),
+    UnitType("raider", "Raider", 9, 10, 8, 2, 9,
+             (Wp("Hand Axe", 6), Wp("Throwing Axe", 5, rng=3, ammo=1, tags=("thrown", "ap"))),
+             glyph="axe", desc="Throws an axe, then charges in."),
+    UnitType("slinger", "Slinger", 7, 9, 7, 0, 8, (Wp("Sling", 4, rng=7, ammo=12), Wp("Knife", 3)),
+             glyph="sling", desc="Skirmisher with a sling."),
+    UnitType("brute", "Brute", 24, 10, 7, 3, 11,
+             (Wp("Great Club", 11, chance=20, tags=("stun",)), Wp("Kick", 3)),
+             glyph="club", big=True, desc="Huge. Its club can stun."),
+    UnitType("warg", "Warg Rider", 12, 11, 10, 2, 9,
+             (Wp("Spear", 5, tags=("charge",)), Wp("Scimitar", 4), Wp("Warg Bite", 5)),
+             move=2, glyph="fang", mounted=True, desc="Rider and wolf both attack."),
+    UnitType("ironguard", "Ironguard", 14, 12, 12, 6, 12,
+             (Wp("Mace", 8, tags=("ap",)), Wp("Shield Bash", 2, chance=25, tags=("stun",))),
+             glyph="helm", desc="Armoured elite. Maces crush armour."),
+    UnitType("shaman", "Ash Shaman", 9, 8, 6, 0, 10, (Wp("Staff", 3),),
+             mana=8, regen=1, spells=("firebolt",), glyph="star", desc="Hurls armour-burning cinders."),
+    UnitType("hexer", "Hexer", 9, 8, 7, 0, 11, (Wp("Venom Dagger", 2, tags=("poison",)),),
+             mana=10, regen=2, spells=("curse", "firebolt"), glyph="eye",
+             desc="Hexes your best fighters."),
+    UnitType("warlord", "Warlord", 34, 15, 13, 9, 16,
+             (Wp("Great Axe", 11, tags=("sweep", "ap")), Wp("Kick", 3)),
+             glyph="crown", big=True, tags=("commander",), desc="Master of Ironveil."),
     # ---- The Barrow ----
-    UnitType("skeleton", "Skeleton", 8, 9, 9, 6, 3, 30, glyph="skull", tint=C["undead"],
-             tags=("undead",), desc="Rattling dead. Never flees."),
-    UnitType("ghoul", "Ghoul", 13, 11, 8, 9, 1, 30, glyph="claw", tint=C["undead"],
-             tags=("undead",), desc="Ravenous corpse."),
-    UnitType("wraith", "Wraith", 14, 12, 12, 9, 0, 30, glyph="ghost", tint=C["undead"],
-             tags=("undead", "ethereal", "ap"), desc="Ethereal. Only magic truly harms it."),
-    UnitType("necromancer", "Necromancer", 10, 8, 7, 3, 1, 14, mana=12, regen=2,
-             spells=("raise_dead", "drain"), glyph="necro", tint=C["undead"],
+    UnitType("skeleton", "Skeleton", 8, 9, 9, 3, 30, (Wp("Rusty Sword", 6),),
+             glyph="skull", tint=C["undead"], tags=("undead",), desc="Rattling dead. Never flees."),
+    UnitType("ghoul", "Ghoul", 13, 11, 8, 1, 30,
+             (Wp("Claw", 4), Wp("Claw", 4), Wp("Bite", 4, tags=("poison",))),
+             glyph="claw", tint=C["undead"], tags=("undead",), desc="Claws twice, bites with grave-rot."),
+    UnitType("wraith", "Wraith", 14, 12, 12, 0, 30, (Wp("Chill Touch", 6, tags=("an", "drain")),),
+             glyph="ghost", tint=C["undead"], tags=("undead", "ethereal"),
+             desc="Ethereal. Its touch ignores armour."),
+    UnitType("necromancer", "Necromancer", 10, 8, 7, 1, 14, (Wp("Bone Staff", 3),),
+             mana=12, regen=2, spells=("raise_dead", "drain"), glyph="necro", tint=C["undead"],
              desc="Raises the fallen as skeletons."),
-    UnitType("barrowking", "Barrow King", 30, 14, 13, 12, 8, 30, glyph="crown", big=True,
-             tint=C["undead"], tags=("undead", "commander", "ap"), desc="Ancient lord of the Barrow."),
+    UnitType("barrowking", "Barrow King", 30, 14, 13, 8, 30,
+             (Wp("Black Blade", 10, tags=("drain", "ap")), Wp("Grave Grip", 3, chance=30, tags=("stun",))),
+             glyph="crown", big=True, tint=C["undead"], tags=("undead", "commander", "fear"),
+             desc="Ancient lord. Terrifies those beside it."),
 ]}
 RECRUITABLE = [u for u in UNITS.values() if u.building]
 
@@ -278,7 +356,7 @@ BUILDINGS = {b.key: b for b in [
     BuildingType("longhouse", "Longhouse", 50, 10, 10, 4,
                  "+4 army cap per level. Wounded soldiers recover faster.", (128, 96, 70), "bed"),
     BuildingType("barracks", "Barracks", 70, 15, 15, 2,
-                 "Spearmen. Lv2: Swordsmen, and idle troops drill up to Regular.",
+                 "Spearmen. Lv2: Berserkers, and idle troops drill up to Regular.",
                  (132, 72, 60), "sword"),
     BuildingType("range", "Archery Range", 70, 10, 15, 2,
                  "Archers. Lv2: Crossbowmen.", (90, 120, 70), "bow"),
@@ -421,9 +499,9 @@ def make_targets():
         Target("Ironveil Hold", "Ironveil",
                "The Warlord's fortress. Walls: +4 defence, +2 armour. Take it to win the war.",
                (760, 340), [5],
-               [("warlord", 1), ("ironguard", 14), ("brute", 8), ("raider", 10), ("slinger", 8),
-                ("warg", 6), ("shaman", 4), ("hexer", 3), ("necromancer", 2)],
-               IV + ["shaman", "hexer", "ironguard", "ironguard"], 62, final=True, xp=22, walls=4),
+               [("warlord", 1), ("ironguard", 12), ("brute", 6), ("raider", 10), ("slinger", 7),
+                ("warg", 5), ("shaman", 3), ("hexer", 2), ("necromancer", 1)],
+               IV + ["shaman", "hexer", "ironguard"], 58, final=True, xp=22, walls=4),
     ]
 
 
@@ -468,8 +546,12 @@ class Soldier:
         return self.t.defense + self.rank + self.b_def
 
     @property
-    def dmg(self):
-        return self.t.dmg + self.rank // 2 + self.b_dmg
+    def frenzied(self):
+        return "frenzy" in self.t.tags and self.hp * 2 < self.max_hp
+
+    @property
+    def dmg_bonus(self):
+        return self.rank // 2 + self.b_dmg + (3 if self.frenzied else 0)
 
     @property
     def prot(self):
@@ -487,10 +569,18 @@ class Soldier:
     def pos(self):
         return (self.gx, self.gy)
 
+    @property
+    def move(self):
+        return self.t.move * (2 if self.hasted else 1)
+
     def reset_for_battle(self):
         self.state = "fight"          # fight / rout / fled / dead
-        self.ammo = self.t.ammo
+        self.ammo = [w.ammo for w in self.t.weapons]
         self.mana = self.t.mana
+        self.poison = 0
+        self.poisoner = None
+        self.hasted = False
+        self.stats = {"dmg": 0, "taken": 0, "kills": 0, "hits": 0, "spells": 0, "healed": 0}
         self.reload = 0
         self.slowed = 0
         self.b_att = self.b_def = self.b_dmg = self.b_prot = self.b_power = 0
@@ -736,8 +826,9 @@ ROLE_COLS = {"static": [0, 1], "support": [1, 2, 0], "caster": [2, 1, 3],
 
 
 class Battle:
-    def __init__(self, kind, title, players, enemies, attacker, target=None, bonuses=None):
+    def __init__(self, kind, title, players, enemies, attacker, target=None, bonuses=None, spoils=("", "")):
         self.kind, self.title, self.attacker, self.target = kind, title, attacker, target
+        self.spoils = spoils
         self.defender = "enemy" if attacker == "player" else "player"
         self.units = players + enemies
         self.occ = {}
@@ -765,7 +856,11 @@ class Battle:
         self.round_notes, self.round_slain = [], []
         self.round_hits = self.round_heals = 0
         self.result = None
+        self.reason = ""
         self.promotions = []
+        self.weapon_dmg, self.spell_counts = {}, {}
+        self.friendly = {"player": 0, "enemy": 0}
+        self.poison_dmg = {"player": 0, "enemy": 0}
         self.finished = False
         self.ui = UI()
         self.continue_cb = None
@@ -836,26 +931,47 @@ class Battle:
     def morale_check(self, u, extra=0):
         if u.state != "fight" or {"commander", "static", "undead", "mindless"} & set(u.t.tags):
             return
+        if u.frenzied:
+            return
         bonus = 2 if self.commander_up(u.team) else (-2 if self.had_commander[u.team] else 0)
         if u.mor + bonus + drn() < 7 + int(self.lost_frac(u.team) * 8) + extra + drn():
             u.state = "rout"
             self.schedule(u, "ROUT", C["white"])
             self.round_notes.append(f"{'Your' if u.team == 'player' else 'Enemy'} {u.t.name} flees!")
 
-    def damage(self, a, d, dmg, ap=False, magic=False, holy=False, stray=False, special=False):
+    def damage(self, a, d, dmg, ap=False, an=False, magic=False, holy=False, stray=False,
+               special=False, source=""):
+        if d.state == "dead":
+            return 0
         if "ethereal" in d.t.tags and not magic and random.random() < 0.75:
             self.schedule(d, "phase", C["muted"])
-            return
+            return 0
         if holy and "undead" in d.t.tags:
             dmg = int(dmg * 1.5) + 1
             special = True
-        prot = d.prot // 2 if ap else d.prot
+        prot = 0 if an else (d.prot // 2 if ap else d.prot)
         dealt = max(0, dmg + drn() - (prot + drn()))
+        if special:
+            color = (255, 214, 120)
+        elif magic:
+            color = (200, 190, 255)
+        else:
+            color = C["white"] if dealt else C["muted"]
+        return self.apply_damage(a, d, dealt, source, color, stray)
+
+    def apply_damage(self, a, d, dealt, source, color, stray=False):
         d.hp = max(0, d.hp - dealt)
         dead = d.hp <= 0
         self.round_hits += 1
-        if dealt and a.team != d.team:
-            a.xp += 1
+        d.stats["taken"] += dealt
+        if a is not None and a.team != d.team:
+            a.stats["dmg"] += dealt
+            if dealt:
+                a.xp += 1
+            key = (a.team, source)
+            self.weapon_dmg[key] = self.weapon_dmg.get(key, 0) + dealt
+        elif a is not None and dealt:
+            self.friendly[a.team] += dealt
 
         def act(u=d, hp=d.hp, dead=dead, dealt=dealt):
             u.disp_hp = hp
@@ -864,45 +980,97 @@ class Battle:
             if dead:
                 u.disp_dead = True
 
-        if special:
-            color = (255, 214, 120)
-        elif magic:
-            color = (200, 190, 255)
-        else:
-            color = C["white"] if dealt else C["muted"]
         self.schedule(d, str(dealt), color, act)
         if dead:
             d.state = "dead"
             self.occ.pop(d.pos, None)
-            if a.team != d.team:
+            if a is not None and a.team != d.team:
                 a.xp += 3
-            self.round_slain.append(f"{self.side_name(d.team)} {d.t.name}")
-            if stray and a.team == d.team:
+                a.stats["kills"] += 1
+            how = " (poison)" if source == "Poison" else ""
+            self.round_slain.append(f"{self.side_name(d.team)} {d.t.name}{how}")
+            if stray and a is not None and a.team == d.team:
                 self.round_notes.append(f"A stray shot killed one of {'your' if a.team == 'player' else 'their'} own!")
         elif d.hp * 2 < d.max_hp:
             self.morale_check(d)
+        return dealt
 
-    def melee(self, a, d, charge=False):
+    def on_hit(self, a, d, w, dealt):
+        if d.state == "dead" or dealt <= 0:
+            return
+        if "stun" in w.tags and random.randint(1, 100) <= w.chance and "static" not in d.t.tags:
+            d.slowed = max(d.slowed, 1)
+            self.schedule(d, "stunned", C["holy"], delay=0.6)
+        if "poison" in w.tags and not ({"undead", "plant"} & set(d.t.tags)):
+            d.poison = min(9, d.poison + 3)
+            d.poisoner = a
+            self.schedule(d, "poisoned", C["nature"], delay=0.6)
+        if "drain" in w.tags and a.hp < a.max_hp:
+            gain = min(dealt // 2 + 1, a.max_hp - a.hp)
+            a.hp += gain
+
+            def act(v=a, hp=a.hp):
+                v.disp_hp = hp
+            self.schedule(a, f"+{gain}", C["dark"], act, delay=0.6)
+
+    def strike(self, a, d, w, charge=False):
         harass = max(0, sum(1 for f in self.foes(d) if cheb(f, d) == 1) - 1)
         defense = d.defense - harass - (4 if d.state == "rout" else 0)
-        self.strikes[a.uid] = tile_center(d.gx, d.gy)
-        if a.att + drn() > defense + drn():
-            bonus = (4 if charge else 0) + (5 if "anti_mount" in a.t.tags and d.t.mounted else 0)
-            self.damage(a, d, a.dmg + bonus, ap="ap" in a.t.tags and not a.t.rng,
-                        magic="magic_weapon" in a.t.tags,
-                        holy="holy" in a.t.tags, special=bool(bonus))
+        if a.att + w.att + drn() <= defense + drn():
+            return 0
+        a.stats["hits"] += 1
+        bonus = (3 if charge else 0) + (5 if "anti_mount" in w.tags and d.t.mounted else 0)
+        dealt = self.damage(a, d, w.dmg + a.dmg_bonus + bonus, ap="ap" in w.tags, an="an" in w.tags,
+                            magic="magic" in w.tags, holy="holy" in w.tags, special=bool(bonus),
+                            source=w.name)
+        self.on_hit(a, d, w, dealt)
+        return dealt
 
-    def shoot(self, a, d):
+    def melee(self, a, d, moved=False, reach_only=False):
+        """Attack with every melee weapon the unit carries, like CoE5."""
+        self.strikes[a.uid] = tile_center(d.gx, d.gy)
+        weapons = [w for w in a.t.weapons if not w.rng and ("charge" not in w.tags or moved)]
+        if reach_only:
+            weapons = [w for w in weapons if w.reach > 1]
+        charging = moved and any("charge" in w.tags for w in weapons)
+        if charging and cheb(a, d) == 1 and d.state == "fight":
+            repel = [w for w in d.t.weapons if "repel" in w.tags]
+            if repel and self.strike(d, a, repel[0]) > 0:
+                self.schedule(a, "repelled!", C["white"], delay=0.35)
+                self.round_notes.append(f"{'Your' if d.team == 'player' else 'Enemy'} {d.t.name} "
+                                        f"breaks a {a.t.name}'s charge!")
+                weapons = [w for w in weapons if "charge" not in w.tags]
+                charging = False
+        for w in weapons:
+            if a.state != "fight":
+                return
+            target = d if self.active(d) and cheb(a, d) <= w.reach else None
+            if target is None:
+                near = [f for f in self.foes(a) if cheb(a, f) <= w.reach]
+                if not near:
+                    return
+                target = min(near, key=lambda f: f.hp)
+            self.strike(a, target, w, charge=charging and "charge" in w.tags)
+            if "sweep" in w.tags:
+                others = [f for f in self.foes(a) if f is not target and cheb(a, f) == 1]
+                if others:
+                    self.strike(a, random.choice(others), w)
+
+    def shoot(self, a, d, idx):
+        w = a.t.weapons[idx]
+        a.ammo[idx] -= 1
         dist = cheb(a, d)
-        if a.att + drn() - dist // 3 > 6 + d.defense // 3 + drn():
+        kw = dict(ap="ap" in w.tags, an="an" in w.tags, magic="magic" in w.tags, source=w.name)
+        if a.att + w.att + drn() - dist // 3 > 6 + d.defense // 3 + drn():
             self.shot(a, d.pos, "arrow")
-            self.damage(a, d, a.dmg, ap="ap" in a.t.tags)
+            a.stats["hits"] += 1
+            self.on_hit(a, d, w, self.damage(a, d, w.dmg + a.dmg_bonus, **kw))
             return
         tx, ty = d.gx + random.randint(-1, 1), d.gy + random.randint(-1, 1)
         self.shot(a, (tx, ty), "arrow")
         victim = self.occ.get((tx, ty))
         if victim is not None and victim is not d and victim is not a:
-            self.damage(a, victim, a.dmg, ap="ap" in a.t.tags, stray=True)
+            self.damage(a, victim, w.dmg, stray=True, **kw)
 
     # ---- spells ------------------------------------------------------------
     def cast(self, u):
@@ -913,6 +1081,9 @@ class Battle:
             if getattr(self, "sp_" + sp.kind)(u, sp):
                 u.mana -= sp.cost
                 u.xp += 1
+                u.stats["spells"] += 1
+                key = (u.team, sp.name)
+                self.spell_counts[key] = self.spell_counts.get(key, 0) + 1
                 return True
         return False
 
@@ -933,7 +1104,7 @@ class Battle:
             return False
         self.shot(u, d.pos, sp.style)
         if 10 + u.power + drn() > 5 + d.defense // 3 + drn():
-            self.damage(u, d, sp.dmg + u.power, ap=sp.ap, magic=True, holy=sp.holy)
+            self.damage(u, d, sp.dmg + u.power, ap=sp.ap, magic=True, holy=sp.holy, source=sp.name)
         return True
 
     def area(self, center):
@@ -963,7 +1134,7 @@ class Battle:
         self.shot(u, center, sp.style)
         self.blasts.append((tile_center(*center), TILE * 1.5, C[sp.style]))
         for v in self.area(center):
-            self.damage(u, v, sp.dmg + u.power, magic=True)
+            self.damage(u, v, sp.dmg + u.power, magic=True, source=sp.name)
         return True
 
     def sp_chain(self, u, sp):
@@ -975,7 +1146,8 @@ class Battle:
             self.shots.append((tile_center(last.gx, last.gy), tile_center(d.gx, d.gy), "lightning"))
             hit.append(d)
             last = d
-            self.damage(u, d, sp.dmg + u.power, ap=True, magic=True)
+            power = sp.dmg + u.power - 2 * (len(hit) - 1)
+            self.damage(u, d, power, ap=True, magic=True, source=sp.name)
             nxt = [f for f in self.foes(u) if f not in hit and cheb(last, f) <= 2]
             d = min(nxt, key=lambda f: cheb(last, f)) if nxt else None
         return True
@@ -1015,6 +1187,7 @@ class Battle:
         amount = min(sp.dmg + u.power + random.randint(0, 2), a.max_hp - a.hp)
         a.hp += amount
         self.round_heals += amount
+        u.stats["healed"] += amount
 
         def act(v=a, hp=a.hp):
             v.disp_hp = hp
@@ -1034,11 +1207,22 @@ class Battle:
         self.blasts.append((tile_center(u.gx, u.gy), TILE * 2.5, C["holy"]))
         return True
 
+    def sp_haste(self, u, sp):
+        near = [a for a in self.allies(u) if cheb(u, a) <= sp.rng and not a.hasted
+                and "static" not in a.t.tags and a is not u]
+        if len(near) < 3:
+            return False
+        for a in near:
+            a.hasted = True
+            self.schedule(a, "hasted", C["lightning"], delay=0.3)
+        self.blasts.append((tile_center(u.gx, u.gy), TILE * 3, C["lightning"]))
+        return True
+
     def sp_curse(self, u, sp):
         foes = [f for f in self.foes(u) if f.state == "fight" and not f.cursed and cheb(u, f) <= sp.rng]
         if not foes:
             return False
-        d = max(foes, key=lambda f: f.att + f.dmg)
+        d = max(foes, key=lambda f: f.att + sum(w.dmg for w in f.t.weapons if not w.rng))
         d.cursed = True
         d.b_att -= 2
         d.b_def -= 3
@@ -1082,7 +1266,7 @@ class Battle:
     def advance(self, u, foes, stop_range=1):
         goal = min(foes, key=lambda f: cheb(u, f) + (3 if f.state == "rout" else 0))
         moved = False
-        for _ in range(u.t.move):
+        for _ in range(u.move):
             if cheb(u, goal) <= stop_range or not self.step_toward(u, goal):
                 break
             moved = True
@@ -1090,7 +1274,7 @@ class Battle:
 
     def flee(self, u):
         edge, dx = (0, -1) if u.team == "player" else (COLS - 1, 1)
-        for _ in range(u.t.move + 1):
+        for _ in range(u.move + 1):
             if u.gx == edge:
                 break
             for ddy in random.sample([0, -1, 1], 3):
@@ -1105,6 +1289,29 @@ class Battle:
             self.occ.pop(u.pos, None)
 
     # ---- one unit's turn ---------------------------------------------------
+    def ranged_weapon(self, u, thrown=False):
+        for i, w in enumerate(u.t.weapons):
+            if w.rng and ("thrown" in w.tags) == thrown and u.ammo[i] > 0:
+                return i, w
+        return None, None
+
+    def retreat(self, u, foes):
+        for _ in range(u.move):
+            here = min(cheb(u, f) for f in foes)
+            best, best_d = None, here
+            for dx, dy in DIRS:
+                p = (u.gx + dx, u.gy + dy)
+                if not (0 <= p[0] < COLS and 0 <= p[1] < ROWS) or p in self.occ:
+                    continue
+                dd = min(max(abs(p[0] - f.gx), abs(p[1] - f.gy)) for f in foes)
+                if dd > best_d:
+                    best, best_d = p, dd
+            if best is None:
+                return
+            del self.occ[u.pos]
+            u.gx, u.gy = best
+            self.occ[best] = u
+
     def act(self, u):
         t = u.t
         if "regen" in t.tags and u.hp < u.max_hp:
@@ -1131,19 +1338,24 @@ class Battle:
                 if reach:
                     self.advance(u, foes, stop_range=max(reach))
                 return
-        if t.rng and u.ammo > 0 and not adj:
-            if u.reload > 0:
-                u.reload -= 1
+
+        idx, w = self.ranged_weapon(u)
+        if w is not None:
+            if adj and "skirmish" in t.tags:
+                self.retreat(u, foes)
+                adj = [f for f in foes if cheb(u, f) == 1]
+            if not adj:
+                if u.reload > 0:
+                    u.reload -= 1
+                    return
+                d = self.pick_target(u, w.rng)
+                if d is not None:
+                    self.shoot(u, d, idx)
+                    if "reload" in w.tags:
+                        u.reload = 1
+                elif "static" not in t.tags:
+                    self.advance(u, foes, stop_range=w.rng)
                 return
-            d = self.pick_target(u, t.rng)
-            if d is not None:
-                self.shoot(u, d)
-                u.ammo -= 1
-                if "reload" in t.tags:
-                    u.reload = 1
-            elif "static" not in t.tags:
-                self.advance(u, foes, stop_range=t.rng)
-            return
         if "static" in t.tags:
             if adj:
                 self.melee(u, random.choice(adj))
@@ -1151,10 +1363,22 @@ class Battle:
         if adj:
             self.melee(u, min(adj, key=lambda f: f.hp))
             return
+        if any(wp.reach > 1 for wp in t.weapons):
+            far = [f for f in foes if cheb(u, f) == 2]
+            if far:
+                self.melee(u, min(far, key=lambda f: f.hp), reach_only=True)
+                return
+        ti, tw = self.ranged_weapon(u, thrown=True)
+        if tw is not None:
+            d = self.pick_target(u, tw.rng)
+            if d is not None and cheb(u, d) >= 2:
+                self.shoot(u, d, ti)
+                self.advance(u, foes)
+                return
         moved = self.advance(u, foes)
         adj = [f for f in foes if self.active(f) and cheb(u, f) == 1]
         if adj:
-            self.melee(u, min(adj, key=lambda f: f.hp), charge=moved and "charge" in t.tags)
+            self.melee(u, min(adj, key=lambda f: f.hp), moved=moved)
 
     def resolve_round(self):
         self.round += 1
@@ -1165,6 +1389,17 @@ class Battle:
             u.prev = u.pos
             if u.state == "fight" and u.t.regen:
                 u.mana = min(u.t.mana, u.mana + u.t.regen)
+        for u in list(self.units):
+            if u.poison > 0 and self.active(u):
+                dmg = 1 + u.poison // 3
+                u.poison -= 1
+                self.poison_dmg[u.team] += dmg
+                self.apply_damage(u.poisoner, u, dmg, "Poison", C["nature"])
+        for u in self.units:
+            if u.state == "fight" and "fear" in u.t.tags:
+                for f in self.foes(u):
+                    if f.state == "fight" and cheb(u, f) == 1:
+                        self.morale_check(f, extra=2)
         for team in ("player", "enemy"):
             lost = self.lost_frac(team)
             for mark in (0.5, 0.75):
@@ -1177,7 +1412,7 @@ class Battle:
                             self.morale_check(u, extra=-2)
         order = [u for u in self.units if self.active(u)]
         random.shuffle(order)
-        order.sort(key=lambda u: -u.t.move)
+        order.sort(key=lambda u: -u.move)
         for u in order:
             if u.state == "rout":
                 self.flee(u)
@@ -1194,12 +1429,17 @@ class Battle:
 
         alive = {team: any(u.team == team and u.state == "fight" for u in self.units)
                  for team in ("player", "enemy")}
+        def how(loser):
+            fled = sum(1 for u in self.units if u.team == loser and u.state in ("fled", "rout"))
+            who = "Your army" if loser == "player" else "The enemy"
+            return f"{who} broke and fled" if fled else f"{who} was wiped out"
         if not alive["player"]:
-            self.result = "enemy"
+            self.result, self.reason = "enemy", how("player")
         elif not alive["enemy"]:
-            self.result = "player"
+            self.result, self.reason = "player", how("enemy")
         elif self.round >= MAX_ROUNDS:
             self.result = self.defender
+            self.reason = "Night fell and the attackers withdrew"
             self.log.append("Night falls. The attackers withdraw.")
         if self.result:
             self.conclude()
@@ -1231,7 +1471,7 @@ class Battle:
 
     # ---- loop --------------------------------------------------------------
     def on_key(self, key):
-        if key == pygame.K_SPACE:
+        if key in (pygame.K_SPACE, pygame.K_p):
             self.paused = not self.paused
         elif key in (pygame.K_1, pygame.K_2, pygame.K_3):
             self.speed = {pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 4}[key]
@@ -1388,8 +1628,10 @@ class Battle:
         for i, line in enumerate(lines):
             text(surf, fit(line, "small", 1000), (24, ly + 4 + i * 18), "small",
                  C["paper"] if i == len(lines) - 1 else C["muted"])
-        text(surf, "SPACE pause · 1/2/3 speed · S skip", (W - 24, ly + 4), "small", C["dim"], right=True)
+        text(surf, "SPACE/P pause · 1/2/3 speed · S skip · hover units for details", (W - 24, ly + 4), "small", C["dim"], right=True)
 
+        if self.paused and not self.finished:
+            r = text(surf, "PAUSED", (W // 2, FIELD_Y + 26), "title", C["gold"], center=True)
         if hover and not self.finished:
             self.draw_tooltip(surf, hover, mouse)
         if self.finished:
@@ -1397,57 +1639,160 @@ class Battle:
 
     def draw_tooltip(self, surf, u, mouse):
         t = u.t
-        lines = [f"{t.name}  ({'yours' if u.team == 'player' else 'enemy'})  {u.rank_name}",
-                 f"HP {u.disp_hp}/{u.max_hp}   Att {u.att}  Def {u.defense}",
-                 f"Dmg {u.dmg}  Prot {u.prot}  Mor {u.mor}"
-                 + (f"   Ammo {u.ammo}" if t.rng else "")
-                 + (f"   Mana {u.mana}/{t.mana}" if t.mana else "")]
+        lines = [(f"{t.name}  ({'yours' if u.team == 'player' else 'enemy'})  {u.rank_name}", "bold", C["paper"]),
+                 (f"HP {u.disp_hp}/{u.max_hp}   Att {u.att}  Def {u.defense}  Prot {u.prot}  Mor {u.mor}"
+                  f"  Move {u.move}" + (f"  Mana {u.mana}/{t.mana}" if t.mana else ""), "small", C["paper"])]
+        for i, w in enumerate(t.weapons):
+            extra = f"  ×{u.ammo[i]}" if w.rng else ""
+            lines.append(("• " + w.describe() + extra, "small", C["paper"]))
         if t.spells:
-            lines.append("Spells: " + ", ".join(SPELLS[s].name for s in t.spells))
-        status = [s for s, on in (("blessed", u.blessed), ("hexed", u.cursed), ("rooted", u.slowed),
+            lines.append(("• Spells: " + ", ".join(SPELLS[s].name for s in t.spells), "small", C["mana"]))
+        status = [s for s, on in (("blessed", u.blessed), ("hexed", u.cursed), ("stunned/rooted", u.slowed),
+                                  ("poisoned", u.poison), ("hasted", u.hasted), ("frenzied", u.frenzied),
                                   ("summoned", u.summoned)) if on]
-        lines.append({"rout": "Fleeing!", "fled": "Fled"}.get(u.state, ", ".join(status) or t.desc))
+        tail = {"rout": "Fleeing!", "fled": "Fled"}.get(u.state, ", ".join(status) or t.desc)
+        lines.append((tail, "small", C["gold"] if status else C["muted"]))
+        if u.stats["dmg"] or u.stats["kills"]:
+            lines.append((f"This battle: {u.stats['kills']} kills, {u.stats['dmg']} damage", "small", C["muted"]))
         bh = 12 + len(lines) * 17
-        bw = max(FONTS["small"].size(s)[0] for s in lines) + 24
+        bw = max(FONTS[f].size(s)[0] for s, f, _ in lines) + 24
         bx, by = min(mouse[0] + 16, W - bw - 6), min(mouse[1] + 16, H - bh - 6)
         pygame.draw.rect(surf, (18, 20, 22), (bx, by, bw, bh), border_radius=4)
         pygame.draw.rect(surf, C["edge"], (bx, by, bw, bh), 1, border_radius=4)
-        for i, s in enumerate(lines):
-            text(surf, s, (bx + 10, by + 6 + i * 17), "bold" if i == 0 else "small")
+        for i, (s, f, col) in enumerate(lines):
+            text(surf, s, (bx + 10, by + 6 + i * 17), f, col)
+
+    # ---- after-battle report ----------------------------------------------
+    def team_rows(self, team):
+        rows = {}
+        for u in self.units:
+            if u.team != team:
+                continue
+            key = (u.t.key, u.summoned)
+            r = rows.setdefault(key, {"t": u.t, "summoned": u.summoned, "start": 0, "lost": 0,
+                                      "fled": 0, "kills": 0, "dmg": 0})
+            r["start"] += 1
+            r["lost"] += u.state == "dead"
+            r["fled"] += u.state in ("fled", "rout")
+            r["kills"] += u.stats["kills"]
+            r["dmg"] += u.stats["dmg"]
+        return sorted(rows.values(), key=lambda r: (r["summoned"], -r["dmg"]))
+
+    def draw_table(self, surf, team, x0, y, color, label):
+        text(surf, label, (x0, y), "head", color)
+        cols = [("Start", 205), ("Lost", 255), ("Fled", 305), ("Kills", 355), ("Damage", 420)]
+        y += 30
+        for name, cx in cols:
+            text(surf, name, (x0 + cx, y), "tiny", C["muted"], center=True)
+        pygame.draw.line(surf, C["edge"], (x0, y + 9), (x0 + 450, y + 9))
+        y += 14
+        rows = self.team_rows(team)
+        totals = {"start": 0, "lost": 0, "fled": 0, "kills": 0, "dmg": 0}
+        for i, r in enumerate(rows):
+            for k in totals:
+                if not r["summoned"] or k in ("kills", "dmg"):
+                    totals[k] += r[k]
+            if i >= 11:
+                continue
+            draw_token(surf, r["t"], team, (x0 + 9, y + 9), radius=8, bar=False)
+            name = r["t"].name + (" (summoned)" if r["summoned"] else "")
+            text(surf, fit(name, "small", 150), (x0 + 24, y + 1), "small")
+            vals = [r["start"], r["lost"], r["fled"], r["kills"], r["dmg"]]
+            for (cname, cx), v in zip(cols, vals):
+                col = C["red"] if cname == "Lost" and v else (C["gold"] if cname == "Fled" and v else C["paper"])
+                text(surf, v, (x0 + cx, y + 9), "small", col if v else C["dim"], center=True)
+            y += 20
+        if len(rows) > 11:
+            text(surf, f"+{len(rows) - 11} more types", (x0 + 24, y + 1), "tiny", C["muted"])
+            y += 16
+        pygame.draw.line(surf, C["edge"], (x0, y + 1), (x0 + 450, y + 1))
+        has_summons = any(r["summoned"] for r in rows)
+        text(surf, "Total*" if has_summons else "Total", (x0 + 24, y + 4), "bold")
+        for (cname, cx), k in zip(cols, ["start", "lost", "fled", "kills", "dmg"]):
+            text(surf, totals[k], (x0 + cx, y + 12), "bold", center=True)
+        if has_summons:
+            text(surf, "* summoned units count toward kills and damage only", (x0 + 24, y + 24), "tiny", C["muted"])
+            return y + 38
+        return y + 26
+
+    def best_unit(self, team):
+        pool = [u for u in self.units if u.team == team and (u.stats["dmg"] or u.stats["kills"] or u.stats["healed"])]
+        if not pool:
+            return "—"
+        u = max(pool, key=lambda v: v.stats["kills"] * 10 + v.stats["dmg"] + v.stats["healed"])
+        s = f"{u.t.name} ({u.rank_name}): {u.stats['kills']} kills, {u.stats['dmg']} dmg"
+        if u.stats["healed"]:
+            s += f", {u.stats['healed']} healed"
+        return s + (" — fell" if u.state == "dead" else "")
+
+    def top_attacks(self, team):
+        items = sorted(((v, k[1]) for k, v in self.weapon_dmg.items() if k[0] == team and v), reverse=True)
+        return ", ".join(f"{name} {v}" for v, name in items[:3]) or "—"
+
+    def spells_text(self, team):
+        items = sorted(((v, k[1]) for k, v in self.spell_counts.items() if k[0] == team), reverse=True)
+        return ", ".join(f"{name} ×{v}" for v, name in items[:4]) or "none"
 
     def draw_result(self, surf, continue_cb):
         shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        shade.fill((8, 9, 10, 170))
+        shade.fill((8, 9, 10, 190))
         surf.blit(shade, (0, 0))
         won = self.result == "player"
-        card = pygame.Rect(W // 2 - 280, 130, 560, 330)
+        card = pygame.Rect(140, 22, 1000, 716)
         pygame.draw.rect(surf, C["panel"], card, border_radius=8)
         pygame.draw.rect(surf, C["gold"] if won else C["red"], card, 2, border_radius=8)
-        text(surf, "VICTORY" if won else "DEFEAT", (W // 2, 180), "big",
-             C["gold"] if won else C["red"], center=True)
-        lost = {}
-        for u in self.units:
-            if u.team == "player" and u.state == "dead" and "static" not in u.t.tags and not u.summoned:
-                lost[u.t.name] = lost.get(u.t.name, 0) + 1
-        slain = sum(1 for u in self.units if u.team == "enemy" and u.state == "dead" and not u.summoned)
-        fled = sum(1 for u in self.units if u.team == "enemy" and u.state in ("fled", "rout") and not u.summoned)
-        summons = sum(1 for u in self.units if u.team == "enemy" and u.state == "dead" and u.summoned)
-        line = f"Enemies slain: {slain}    Enemies fled: {fled}"
-        if summons:
-            line += f"    Summoned foes destroyed: {summons}"
-        text(surf, line, (W // 2, 240), "body", center=True)
-        loss = ", ".join(f"{n} {k}" for k, n in lost.items()) or "none"
-        text(surf, fit(f"Your losses: {loss}", "body", 520), (W // 2, 266), "body", center=True)
-        y = 300
-        if self.promotions:
-            text(surf, "Promotions", (W // 2, y), "bold", C["gold"], center=True)
+        text(surf, "VICTORY" if won else "DEFEAT", (W // 2, 62), "big", C["gold"] if won else C["red"], center=True)
+        text(surf, f"{self.title}  ·  {self.reason} after {self.round} rounds.", (W // 2, 108), "body",
+             C["muted"], center=True)
+
+        left, right = card.x + 30, card.centerx + 20
+        y1 = self.draw_table(surf, "player", left, 128, C["blue"], "Your army")
+        y2 = self.draw_table(surf, "enemy", right, 128, C["red"], "The enemy")
+        y = max(y1, y2) + 6
+        pygame.draw.line(surf, C["edge"], (card.x + 20, y), (card.right - 20, y))
+        y += 10
+
+        heal = sum(u.stats["healed"] for u in self.units if u.team == "player")
+        eheal = sum(u.stats["healed"] for u in self.units if u.team == "enemy")
+        rows = [
+            (("Hero of the day", self.best_unit("player")), ("Deadliest foe", self.best_unit("enemy"))),
+            (("Your best attacks", self.top_attacks("player")), ("Their best attacks", self.top_attacks("enemy"))),
+            (("Your spells", self.spells_text("player")), ("Their spells", self.spells_text("enemy"))),
+            (("Healing / poison", f"{heal} healed, {self.poison_dmg['enemy']} poison dealt"),
+             ("Healing / poison", f"{eheal} healed, {self.poison_dmg['player']} poison dealt")),
+            (("Friendly fire", f"{self.friendly['player']} damage to your own"),
+             ("Friendly fire", f"{self.friendly['enemy']} damage to their own")),
+        ]
+        for (l1, v1), (l2, v2) in rows:
+            for x, lab, val in ((left, l1, v1), (right, l2, v2)):
+                text(surf, lab, (x, y), "bold", C["gold"])
+                text(surf, fit(val, "small", 300), (x + 148, y + 2), "small")
             y += 22
+        y += 6
+        pygame.draw.line(surf, C["edge"], (card.x + 20, y), (card.right - 20, y))
+        y += 10
+
+        survivors = [u for u in self.units if u.team == "player" and u.state != "dead"
+                     and not u.summoned and "static" not in u.t.tags]
+        xp = sum(u.xp - u.start_xp for u in survivors)
+        text(surf, f"Experience: your {len(survivors)} survivors earned {xp} XP.", (left, y), "bold")
+        y += 22
+        if self.promotions:
             names = [f"{u.t.name} → {u.rank_name}" for u in self.promotions]
-            shown = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
-            for line in wrap(shown, "small", 500)[:2]:
-                text(surf, line, (W // 2, y), "small", center=True)
+            shown = "Promotions: " + ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+            for line in wrap(shown, "small", card.w - 60)[:2]:
+                text(surf, line, (left, y), "small", C["gold"])
                 y += 18
-        self.ui.button(surf, (W // 2 - 90, 400, 180, 40), "Continue (Enter)", continue_cb, accent=True)
+        else:
+            text(surf, "No promotions this time.", (left, y), "small", C["muted"])
+            y += 18
+        y += 6
+        outcome = self.spoils[0] if won else self.spoils[1]
+        if outcome:
+            for line in wrap(outcome, "bold", card.w - 60)[:2]:
+                text(surf, line, (left, y), "bold", C["gold"] if won else C["red"])
+                y += 20
+        self.ui.button(surf, (W // 2 - 100, card.bottom - 52, 200, 38), "Continue (Enter)", continue_cb, accent=True)
 
 
 # --------------------------------------------------------------------------
@@ -1492,6 +1837,7 @@ class Game:
         self.selected, self.map_sel = HALL_PLOT, 0
         self.toasts = []
         self.over = None
+        self.paused = False
         self.ui = UI()
         self.peons = [{"x": 400.0, "y": 300.0, "tx": 400.0, "ty": 300.0} for _ in range(6)]
         self.decor = self.make_decor()
@@ -1603,8 +1949,11 @@ class Game:
             return
         self.return_scene = self.scene
         bonuses = dict(self.bonuses(), **target.bonuses())
+        win = ("Ironveil falls. You have won the war!" if target.final
+               else f"{target.name} is yours. Spoils: " + ", ".join(target.reward_lines()).rstrip(".") + ".")
+        lose = f"The survivors of {target.name} will heal and hold the walls against your next attempt."
         self.battle = Battle("attack", f"Assault on {target.name}", self.available(), target.garrison,
-                             attacker="player", target=target, bonuses=bonuses)
+                             attacker="player", target=target, bonuses=bonuses, spoils=(win, lose))
         self.scene = "battle"
 
     def next_raid(self):
@@ -1625,8 +1974,13 @@ class Game:
             return
         self.return_scene = self.scene
         who = "The dead rise against" if undead else f"Raid #{self.raid_count} on"
+        loot = 25 + 10 * min(self.raid_count, 16)
+        lost_gold = int(self.gold * 0.3)
+        fall = " This will be the end of your town!" if self.integrity <= 1 else ""
+        spoils = (f"The raid is broken. You loot {loot} gold from the fallen.",
+                  f"The raiders will sack the town: -1 town strength and {lost_gold} gold stolen.{fall}")
         self.battle = Battle("defense", f"{who} your town", defenders + towers, enemies,
-                             attacker="enemy", bonuses=self.bonuses())
+                             attacker="enemy", bonuses=self.bonuses(), spoils=spoils)
         self.scene = "battle"
 
     def lose_raid(self):
@@ -1688,6 +2042,8 @@ class Game:
             return
         if self.scene == "battle":
             self.battle.update(dt)
+            return
+        if self.paused:
             return
         self.time += dt
         self.gold = min(9999, self.gold + self.gold_rate() * dt)
@@ -1788,6 +2144,8 @@ class Game:
     def on_key(self, key):
         if self.scene == "battle":
             self.battle.on_key(key)
+        elif key in (pygame.K_p, pygame.K_SPACE):
+            self.paused = not self.paused
         elif key == pygame.K_m:
             self.scene = "map" if self.scene == "town" else "town"
         elif key == pygame.K_ESCAPE and self.scene == "map":
@@ -1811,6 +2169,12 @@ class Game:
                 self.draw_map(surf)
                 self.draw_map_panel(surf)
                 cx = MAP_RECT.centerx
+            if self.paused:
+                banner = "PAUSED — you can still build, train and plan. Press P to resume."
+                img = FONTS["bold"].render(banner, True, C["ink"])
+                r = img.get_rect(center=(cx, 530 if self.scene == "town" else 735))
+                pygame.draw.rect(surf, C["gold"], r.inflate(24, 10), border_radius=5)
+                surf.blit(img, r)
             for i, (msg, life, col) in enumerate(self.toasts[-4:]):
                 img = FONTS["bold"].render(msg, True, col)
                 img.set_alpha(int(255 * min(1, life)))
@@ -1853,7 +2217,9 @@ class Game:
         comp, undead = self.next_raid()
         col = C["red"] if self.raid_timer < 30 else C["paper"]
         text(surf, f"Next {'undead ' if undead else ''}raid in {int(self.raid_timer)}s", (840, 12), "head", col)
-        text(surf, fit(comp_text(comp), "small", 420), (840, 38), "small", C["muted"])
+        text(surf, fit(comp_text(comp), "small", 320), (840, 38), "small", C["muted"])
+        self.ui.button(surf, (1170, 12, 94, 36), "Resume" if self.paused else "Pause (P)",
+                       lambda: setattr(self, "paused", not self.paused), accent=self.paused)
 
     # ---- drawing: town ---------------------------------------------------
     def draw_town(self, surf):
@@ -1990,21 +2356,23 @@ class Game:
             for t in units:
                 ok, why = self.can_recruit(p, t.key)
                 locked = p.level < t.req_level
-                draw_token(surf, t, "player", (x + 16, y + 22), radius=15, bar=False)
-                text(surf, t.name, (x + 42, y + 2), "bold", C["dim"] if locked else C["paper"])
+                draw_token(surf, t, "player", (x + 16, y + 26), radius=15, bar=False)
+                text(surf, t.name, (x + 42, y), "bold", C["dim"] if locked else C["paper"])
                 cost = f"{t.gold}g" + (f" {t.iron}i" if t.iron else "") + f"  {int(t.train)}s"
-                text(surf, cost, (x + 160, y + 3), "small", C["gold"])
-                stats = f"HP {t.hp} Att {t.att} Def {t.defense} Dmg {t.dmg} Prot {t.prot} Mor {t.mor}"
-                if t.rng:
-                    stats += f" Rng {t.rng}"
-                if t.spells:
-                    stats += f" Mana {t.mana}"
-                text(surf, fit(stats, "small", 318), (x + 42, y + 20), "small", C["muted"])
-                text(surf, fit(why or t.desc, "small", 318), (x + 42, y + 36), "small",
+                text(surf, cost, (x + 175, y + 1), "small", C["gold"])
+                stats = f"HP {t.hp}  Att {t.att}  Def {t.defense}  Prot {t.prot}  Mor {t.mor}"
+                if t.move > 1:
+                    stats += f"  Move {t.move}"
+                if t.mana:
+                    stats += f"  Mana {t.mana}"
+                text(surf, fit(stats, "small", 318), (x + 42, y + 17), "small", C["muted"])
+                text(surf, fit(t.attack_line(), "small", 318), (x + 42, y + 33), "small",
+                     C["dim"] if locked else (215, 200, 160))
+                text(surf, fit(why or t.desc, "small", 318), (x + 42, y + 49), "small",
                      C["red"] if why else C["dim"])
-                self.ui.button(surf, (box.right - 80, y + 8, 64, 28), "Train",
+                self.ui.button(surf, (box.right - 80, y + 14, 64, 28), "Train",
                                lambda k=t.key: self.recruit(p, k), enabled=ok)
-                y += 58
+                y += 70
             if p.queue:
                 text(surf, "Queue:", (x, y + 2), "small", C["muted"])
                 for i, q in enumerate(p.queue):
