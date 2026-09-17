@@ -4158,9 +4158,18 @@ class Game:
             gfx.ellipse(surf, (40, 34, 26), (body.x - 4, base_y - 5, w + 8, 10))
             gfx.rect(surf, col, body)
             roof_h = 12 + lvl * 2
-            gfx.polygon(surf, mix(col, C["ink"], 0.4),
-                                [(body.x - 5, body.y), (body.centerx, body.y - roof_h), (body.right + 5, body.y)])
-            if p.key in ("hall", "tower", "walls") and lvl >= 2:
+            if p.key == "walls":
+                # A wall carries a crenellated parapet rather than a roof, from Lv1 up.
+                cap = pygame.Rect(body.x - 5, body.y - 7, w + 10, 7)
+                gfx.rect(surf, mix(col, C["ink"], 0.4), cap)
+                step = max(8, cap.w // (3 + lvl))
+                for mx in range(cap.x, cap.right - 4, step):
+                    gfx.rect(surf, mix(col, C["paper"], 0.1),
+                             (mx, cap.y - 5, min(step - 3, cap.right - mx), 5))
+            else:
+                gfx.polygon(surf, mix(col, C["ink"], 0.4),
+                                    [(body.x - 5, body.y), (body.centerx, body.y - roof_h), (body.right + 5, body.y)])
+            if p.key in ("hall", "tower", "walls") and lvl >= (2 if p.key == "hall" else 1):
                 for side in (-1, 1):
                     tx = body.centerx + side * (w // 2 - 5)
                     gfx.rect(surf, mix(col, C["ink"], 0.2), (tx - 5, body.y - 10 - lvl * 2, 10, h + 10 + lvl * 2))
