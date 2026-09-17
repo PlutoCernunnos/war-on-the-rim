@@ -1,2 +1,22 @@
-.json
-.dat
+# Files the game writes next to the script
+war_on_the_rim_save.dat
+war_on_the_rim_settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
