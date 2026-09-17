@@ -37,7 +37,7 @@ import pygame
 
 W, H = 1280, 760
 FPS = 60
-SAVE_VERSION = 4
+SAVE_VERSION = 5
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVE_PATH = os.path.join(BASE_DIR, "war_on_the_rim_save.dat")
 SETTINGS_PATH = os.path.join(BASE_DIR, "war_on_the_rim_settings.json")
@@ -1378,7 +1378,8 @@ def pick_units(faction, budget, max_tier, rng, region=1):
 
 class Target:
     def __init__(self, idx, name, faction, desc, pos, prereq, comp, depth, xp=0, walls=0,
-                 gold=0, income=0.0, iron_income=0.0, ess_income=0.0, special="", boss=False, final=False):
+                 gold=0, income=0.0, iron_income=0.0, ess_income=0.0, special="", boss=False, final=False,
+                 ground="plains"):
         self.idx, self.name, self.faction, self.desc, self.pos = idx, name, faction, desc, pos
         self.prereq, self.depth = prereq, depth
         self.xp, self.walls = xp, walls
@@ -1386,7 +1387,12 @@ class Target:
         self.cap = min(MAX_GARRISON + 20, int(len(comp) * 1.3) + 1)
         self.gold, self.income, self.iron_income, self.ess_income = gold, income, iron_income, ess_income
         self.special, self.boss, self.final = special, boss, final
+        self.ground = ground
         self.conquered = False
+
+    def field_plan(self):
+        return FieldPlan(self.ground, seed=self.idx * 977 + self.walls * 31 + len(self.name),
+                         walls=self.walls, holder="enemy")
 
     def pool(self):
         return [k for k, w in FACTIONS[self.faction]["units"] for _ in range(int(w * 2) or 1)
@@ -1498,11 +1504,12 @@ class Region:
                 else:
                     gold = int(gold * 1.6)
                 f = FACTIONS[faction]
+                ground = rng.choice(FACTION_GROUND.get(faction, ("plains",)))
                 name = f"{rng.choice(f['pre'])}{rng.choice(f['suf'])} {rng.choice(f['place'])}"
                 desc = rng.choice(f["desc"]) + (f" Walls: +{walls} defence." if walls else "")
                 t = Target(len(self.targets), name, faction, desc, (xs[c], y), [], comp, depth,
                            xp=max(0, (depth - 1) * 2 + xp_base + extra_xp), walls=walls, gold=gold, income=income,
-                           iron_income=iron, ess_income=ess, special=special)
+                           iron_income=iron, ess_income=ess, special=special, ground=ground)
                 self.targets.append(t)
                 col.append(t)
             if prev:
@@ -1523,9 +1530,11 @@ class Region:
                       + (" Take it to win the war!" if final else " Take it to push deeper into the Rim."),
                       (min(xs[-1] + 10, 735), 339), [p.idx for p in prev], comp, ncols + 1,
                       xp=max(0, ncols * 2 + 6 + xp_base + extra_xp), walls=walls, gold=250 * number,
-                      income=round(0.8 * number, 1), boss=True, final=final)
+                      income=round(0.8 * number, 1), boss=True, final=final,
+                      ground=rng.choice(FACTION_GROUND.get(boss_faction, ("plains",))))
         self.targets.append(boss)
         self.boss = boss
+        self.home_ground = rng.choice(FACTION_GROUND.get(factions[0], ("plains",)))
         for t in self.targets:
             t.region_bonus = number - 1
 
@@ -1580,6 +1589,7 @@ class Soldier:
         self.name = make_name() if named else ""
         self.kills_total = 0
         self.battles = 0
+        self.traits = []
         self.reset_for_battle()
 
     @property
@@ -1634,7 +1644,7 @@ class Soldier:
 
     @property
     def move(self):
-        return self.t.move * (2 if self.hasted else 1)
+        return max(1, self.t.move + self.b_move) * (2 if self.hasted else 1)
 
     @property
     def pos(self):
@@ -1668,7 +1678,7 @@ class Soldier:
         self.poison = 0
         self.poisoner = None
         self.b_att = self.b_def = self.b_dmg = self.b_prot = self.b_power = self.b_mor = 0
-        self.b_rng = self.b_ranged_ap = self.b_summon_cap = 0
+        self.b_rng = self.b_ranged_ap = self.b_summon_cap = self.b_move = 0
         self.blessed = self.cursed = self.raised = self.hasted = self.stoned = False
         self.summons = {}
         self.start_rank = self.rank
@@ -1679,7 +1689,22 @@ class Soldier:
         self.disp_dead = False
         self.hidden = False
         self.flash = 0.0
-        self.stats = {"dmg": 0, "taken": 0, "kills": 0, "hits": 0, "spells": 0, "healed": 0}
+        self.stats = {"dmg": 0, "taken": 0, "kills": 0, "hits": 0, "spells": 0, "healed": 0,
+                      "steps": 0, "great": 0}
+        self.apply_mods(trait_mods(self.traits))
+
+
+    def add_trait(self, key):
+        if key in self.traits or key not in TRAITS or len(self.traits) >= MAX_TRAITS:
+            return False
+        self.traits.append(key)
+        return True
+
+    def drop_trait(self, key):
+        if key in self.traits:
+            self.traits.remove(key)
+            return True
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -1935,6 +1960,84 @@ def draw_token(surf, t, team, center, hp_frac=1.0, flash=False, routed=False, ra
         gfx.rect(surf, C["white"], (x + r - 1, y - r - 16, 9, 6))
 
 
+def draw_terrain(surf, kind, rect, seed, base):
+    """A light motif over a tinted tile: trees, stones, ripples."""
+    x, y, w, h = rect
+    cx, cy = x + w / 2, y + h / 2
+    s = w / 54
+    if kind == "forest":
+        dark = mix(base, C["ink"], 0.45)
+        for i, (ox, oy) in enumerate(((-0.24, 0.1), (0.2, -0.05), (0.0, 0.26))):
+            tx, ty = cx + ox * w, cy + oy * h
+            gfx.polygon(surf, dark, [(tx, ty - 9 * s), (tx - 6 * s, ty + 5 * s), (tx + 6 * s, ty + 5 * s)])
+            if i == 0:
+                gfx.rect(surf, mix(base, C["ink"], 0.6), (tx - s, ty + 4 * s, 2 * s, 4 * s))
+    elif kind == "scrub":
+        col = mix(base, C["ink"], 0.3)
+        for ox, oy in ((-0.2, 0.15), (0.18, -0.12), (0.05, 0.3)):
+            gfx.circle(surf, col, (cx + ox * w, cy + oy * h), max(1, 3 * s))
+    elif kind == "hill":
+        col = mix(base, C["paper"], 0.16)
+        for i in range(2):
+            gfx.arc(surf, col, (cx - (18 - i * 7) * s, cy - (6 - i * 6) * s,
+                                (36 - i * 14) * s, (20 - i * 6) * s), 0.25, 2.9, max(1, int(2 * s)))
+    elif kind == "marsh":
+        col = mix(base, C["ink"], 0.35)
+        for i in range(3):
+            yy = cy + (i - 1) * 8 * s
+            gfx.line(surf, col, (cx - 14 * s, yy), (cx + 14 * s, yy), max(1, int(2 * s)))
+    elif kind == "water":
+        col = mix(base, C["paper"], 0.22)
+        for i in range(3):
+            yy = cy + (i - 1) * 9 * s
+            gfx.arc(surf, col, (cx - 14 * s, yy - 4 * s, 28 * s, 10 * s), 3.5, 5.9, max(1, int(2 * s)))
+    elif kind == "rock":
+        for ox, oy, r in ((-0.16, 0.08, 9), (0.18, -0.06, 7), (0.04, 0.24, 6)):
+            px, py = cx + ox * w, cy + oy * h
+            gfx.polygon(surf, mix(base, C["paper"], 0.2),
+                        [(px - r * s, py + r * 0.6 * s), (px - r * 0.5 * s, py - r * s),
+                         (px + r * 0.7 * s, py - r * 0.5 * s), (px + r * s, py + r * 0.7 * s)])
+            gfx.polygon(surf, mix(base, C["ink"], 0.35),
+                        [(px - r * s, py + r * 0.6 * s), (px + r * s, py + r * 0.7 * s),
+                         (px + r * 0.2 * s, py + r * 0.95 * s)])
+    elif kind == "rubble":
+        col = mix(base, C["paper"], 0.18)
+        for ox, oy in ((-0.2, 0.12), (0.1, -0.1), (0.22, 0.22), (-0.05, 0.28)):
+            gfx.rect(surf, col, (cx + ox * w, cy + oy * h, 5 * s, 4 * s))
+
+
+def draw_struct(surf, s, center):
+    """A wall, gate or tower, worn down as it takes damage."""
+    cx, cy = center
+    half = TILE * 0.5
+    frac = s.hp / s.max_hp
+    if s.kind == "gate":
+        body = mix((126, 90, 56), (70, 50, 34), 1 - frac)
+        gfx.rect(surf, body, (cx - half * 0.86, cy - half * 0.88, half * 1.72, half * 1.76))
+        for i in range(3):
+            lx = cx - half * 0.5 + i * half * 0.5
+            gfx.line(surf, (52, 38, 26), (lx, cy - half * 0.8), (lx, cy + half * 0.8),
+                     max(1, int(TILE / 27)))
+    else:
+        body = mix((150, 144, 134), (84, 80, 76), 1 - frac)
+        tall = half * (1.96 if s.kind == "tower" else 1.44)
+        gfx.rect(surf, body, (cx - half * 0.9, cy - tall / 2, half * 1.8, tall))
+        if s.kind == "tower":
+            gfx.rect(surf, mix(body, C["ink"], 0.4),
+                     (cx - half * 0.3, cy - half * 0.3, half * 0.6, half * 0.6))
+        merlons = 4 if s.kind == "tower" else 3
+        step = half * 1.72 / merlons
+        for i in range(merlons):
+            gfx.rect(surf, mix(body, C["paper"], 0.12),
+                     (cx - half * 0.86 + i * step, cy - tall / 2 - half * 0.22, step * 0.62, half * 0.26))
+    tint = C["blue"] if s.team == "player" else C["red"]
+    gfx.rect(surf, mix(tint, C["ink"], 0.35), (cx - half * 0.9, cy + half * 0.74, half * 1.8, half * 0.16))
+    if frac < 1:
+        bw = half * 1.6
+        gfx.rect(surf, (26, 24, 22), (cx - bw / 2, cy - half - 7, bw, 4))
+        gfx.rect(surf, C["gold"] if frac > 0.4 else C["red"], (cx - bw / 2, cy - half - 7, bw * frac, 4))
+
+
 def tier_badge(surf, tier, pos, font="tinyb"):
     img = FONTS[font].render(f"T{tier}", True, C["ink"])
     r = img.get_rect(topleft=pos).inflate(6, 2)
@@ -2083,15 +2186,271 @@ def unit_role(t):
     return "front"
 
 
+# --------------------------------------------------------------------------
+# Ground
+# --------------------------------------------------------------------------
+# Every battle is fought over its own ground. Terrain slows movement, gives
+# cover from missiles and shifts the odds in melee, so where a unit stands
+# matters as much as what it is.
+TERRAIN = {
+    "plain": {"name": "Open ground", "cost": 1, "def": 0, "att": 0, "cover": 0, "note": "",
+              "tint": None},
+    "scrub": {"name": "Scrub", "cost": 1, "def": 0, "att": 0, "cover": 1, "note": "a little cover",
+              "tint": ((86, 96, 58), 0.5)},
+    "forest": {"name": "Forest", "cost": 2, "def": 1, "att": 0, "cover": 3,
+               "note": "cover from missiles, slow going, no room to charge",
+               "tint": ((38, 60, 40), 0.75)},
+    "hill": {"name": "High ground", "cost": 2, "def": 1, "att": 1, "cover": 0,
+             "note": "+1 attack and defence to whoever holds it",
+             "tint": ((116, 100, 68), 0.45)},
+    "marsh": {"name": "Marsh", "cost": 3, "def": -1, "att": 0, "cover": 0,
+              "note": "wading troops are easy targets and cannot charge",
+              "tint": ((62, 68, 58), 0.7)},
+    "water": {"name": "Deep water", "cost": 99, "def": 0, "att": 0, "cover": 0,
+              "note": "only fliers cross it", "tint": ((44, 78, 104), 0.85)},
+    "rock": {"name": "Boulders", "cost": 99, "def": 0, "att": 0, "cover": 0,
+             "note": "blocks movement and line of sight", "tint": ((96, 92, 86), 0.8)},
+    "rubble": {"name": "Rubble", "cost": 2, "def": 1, "att": 0, "cover": 1,
+               "note": "broken stone to fight behind", "tint": ((88, 82, 74), 0.6)},
+}
+WALL_OFF = ("water", "rock")             # nothing walks in, fliers cross water
+SIGHT_BLOCK = ("rock",)                  # nothing shoots through
+NO_CHARGE = ("forest", "marsh", "rubble")
+
+FIELD_PROFILES = {
+    "plains": ("Open plains", "Barely any cover. Cavalry and archers have the run of it."),
+    "woods": ("Woodland", "Forest cover blunts arrows and breaks up charges."),
+    "rocky": ("Rocky ground", "Boulders and high ground split the line."),
+    "marsh": ("Marshland", "Mud and standing water slow everything down."),
+    "river": ("River ground", "A stream cuts the field. The fords are choke points."),
+}
+FACTION_GROUND = {
+    "Ironveil": ("rocky", "rocky", "plains", "plains"),
+    "Barrow": ("marsh", "marsh", "woods", "plains"),
+    "Wildkin": ("woods", "woods", "marsh", "river"),
+    "Emberkin": ("rocky", "plains", "rocky", "plains"),
+}
+
+
+def ground_name(profile):
+    return FIELD_PROFILES.get(profile, FIELD_PROFILES["plains"])[0]
+
+
+def tiles_between(a, b):
+    """The tiles a missile passes over, endpoints excluded."""
+    x0, y0 = a
+    x1, y1 = b
+    n = max(abs(x1 - x0), abs(y1 - y0))
+    for i in range(1, n):
+        q = i / n
+        yield (int(round(x0 + (x1 - x0) * q)), int(round(y0 + (y1 - y0) * q)))
+
+
+# --------------------------------------------------------------------------
+# Walls, gates and towers
+# --------------------------------------------------------------------------
+# Fortifications stand on the field between the two armies. They bar the way,
+# they shelter whoever holds them, and they have to be knocked down. Fliers go
+# over the top; siege engines chew through in a couple of shots.
+STRUCT_TYPES = {
+    "wall": {"name": "Palisade", "hp": 30, "def": 1},
+    "gate": {"name": "Gate", "hp": 22, "def": 1},
+    "tower": {"name": "Tower", "hp": 44, "def": 2},
+}
+
+
+class Structure:
+    def __init__(self, kind, pos, team, scale=1.0):
+        self.kind, self.pos, self.team = kind, pos, team
+        self.max_hp = max(8, int(STRUCT_TYPES[kind]["hp"] * scale))
+        self.hp = self.max_hp
+
+    @property
+    def name(self):
+        return STRUCT_TYPES[self.kind]["name"]
+
+    @property
+    def def_bonus(self):
+        return STRUCT_TYPES[self.kind]["def"]
+
+    @property
+    def alive(self):
+        return self.hp > 0
+
+
+class FieldPlan:
+    """The recipe for one battlefield: ground profile plus any fortifications."""
+
+    def __init__(self, profile="plains", seed=0, walls=0, holder="enemy"):
+        self.profile = profile if profile in FIELD_PROFILES else "plains"
+        self.seed = seed
+        self.walls = walls
+        self.holder = holder
+
+    @property
+    def profile_name(self):
+        return FIELD_PROFILES[self.profile][0]
+
+    @property
+    def profile_note(self):
+        return FIELD_PROFILES[self.profile][1]
+
+    def generate(self):
+        """Terrain and structures for the field size currently configured."""
+        rng = random.Random(self.seed)
+        terrain = {}
+        lo, hi = 3, COLS - 4             # leave the deployment edges walkable
+
+        def blob(kind, cx, cy, r, density=0.8):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    x, y = cx + dx, cy + dy
+                    if lo <= x <= hi and 0 <= y < ROWS and math.hypot(dx, dy) <= r + 0.35 \
+                            and rng.random() < density:
+                        terrain[(x, y)] = kind
+
+        def scatter(kind, n, r=(1, 2), density=0.8):
+            for _ in range(max(1, n)):
+                blob(kind, rng.randint(lo, hi), rng.randrange(ROWS), rng.randint(*r), density)
+
+        area = COLS * ROWS / (22 * 11)
+        p = self.profile
+        if p == "woods":
+            scatter("forest", int(5 * area), (1, 3))
+            scatter("scrub", int(3 * area), (1, 2), 0.6)
+            scatter("rock", int(area), (0, 1), 0.5)
+        elif p == "rocky":
+            scatter("hill", int(3 * area), (1, 2))
+            scatter("rock", int(3 * area), (0, 1), 0.7)
+            scatter("scrub", int(2 * area), (1, 2), 0.5)
+        elif p == "marsh":
+            scatter("marsh", int(5 * area), (1, 3))
+            scatter("water", int(2 * area), (0, 1), 0.6)
+            scatter("scrub", int(2 * area), (1, 2), 0.5)
+        elif p == "river":
+            x = COLS // 2 + rng.randint(-1, 1)
+            fords = {rng.randrange(1, ROWS - 1) for _ in range(2)}
+            for y in range(ROWS):
+                wx = x + rng.choice((-1, 0, 0, 1))
+                for dx in (0, 1):
+                    wet = "marsh" if (y in fords or (y - 1) in fords) else "water"
+                    terrain[(wx + dx, y)] = wet
+            scatter("forest", int(2 * area), (1, 2))
+            scatter("scrub", int(2 * area), (1, 2), 0.5)
+        else:
+            scatter("scrub", int(3 * area), (1, 2), 0.5)
+            scatter("hill", int(area), (1, 2), 0.7)
+            if rng.random() < 0.5:
+                scatter("forest", 1, (1, 2), 0.7)
+        structs = self.fortify(rng, terrain)
+        self.open_lanes(terrain, structs)
+        return terrain, structs
+
+    def fortify(self, rng, terrain):
+        """A wall line with a gate, towers on the flanks, defenders behind it."""
+        structs = {}
+        if self.walls <= 0:
+            return structs
+        scale = 0.75 + 0.3 * self.walls
+        wx = COLS // 2 + (3 if self.holder == "enemy" else -3)
+        gates = {ROWS // 2}
+        if self.walls >= 4:
+            gates.add(rng.choice([ROWS // 4, ROWS - 1 - ROWS // 4]))
+        towers = set()
+        for i in range(min(max(0, self.walls // 2), 4)):
+            towers.add(max(0, min(ROWS - 1, ROWS // 2 + (2 + i * 2) * (-1) ** i)))
+        for y in range(ROWS):
+            kind = "gate" if y in gates else ("tower" if y in towers else "wall")
+            structs[(wx, y)] = Structure(kind, (wx, y), self.holder, scale)
+            terrain.pop((wx, y), None)
+        return structs
+
+    @staticmethod
+    def open_lanes(terrain, structs):
+        """No column may be sealed off by terrain alone, or armies never meet."""
+        for x in range(COLS):
+            walkable = [y for y in range(ROWS)
+                        if terrain.get((x, y)) not in WALL_OFF and (x, y) not in structs]
+            need = max(2, ROWS // 4)
+            if len(walkable) >= need:
+                continue
+            rows = [y for y in range(ROWS) if (x, y) not in structs]
+            random.Random(x * 7919).shuffle(rows)
+            for y in rows[:need]:
+                if terrain.get((x, y)) in WALL_OFF:
+                    terrain[(x, y)] = "rubble" if terrain[(x, y)] == "rock" else "marsh"
+
+
+# --------------------------------------------------------------------------
+# Traits
+# --------------------------------------------------------------------------
+# Soldiers take more than experience out of a battle. Traits are permanent,
+# they stack with rank, and the bad ones stick.
+@dataclass(frozen=True)
+class TraitType:
+    key: str
+    name: str
+    desc: str
+    mods: tuple = ()
+    good: bool = True
+
+
+TRAIT_LIST = [
+    TraitType("bloodthirsty", "Bloodthirsty", "Cut down four or more foes in one battle.",
+              (("att", 1), ("dmg", 1))),
+    TraitType("slayer", "Slayer", "Killed a foe far above his own weight.",
+              (("att", 1), ("def", 1))),
+    TraitType("stalwart", "Stalwart", "Held the line while the army broke around him.",
+              (("def", 1), ("mor", 3))),
+    TraitType("scarred", "Scarred", "Walked off a wound that should have killed him.",
+              (("prot", 1), ("mor", 2))),
+    TraitType("hardened", "Hardened", "Stood in the thick of it and took the blows.",
+              (("prot", 1),)),
+    TraitType("marksman", "Marksman", "Landed shot after shot in one battle.",
+              (("att", 1),)),
+    TraitType("adept", "Adept", "Spent a whole battle casting.",
+              (("power", 1), ("mana", 2))),
+    TraitType("swift", "Swift", "Covered the field again and again.",
+              (("move", 1),)),
+    TraitType("shaken", "Shaken", "Broke and ran. Win a battle without fleeing to shake it off.",
+              (("mor", -3),), good=False),
+    TraitType("lamed", "Lamed", "An old wound that never healed right.",
+              (("move", -1), ("def", -1)), good=False),
+]
+TRAITS = {t.key: t for t in TRAIT_LIST}
+MAX_TRAITS = 3
+
+
+def trait_mods(keys):
+    out = {}
+    for key in keys:
+        t = TRAITS.get(key)
+        if t:
+            for stat, val in t.mods:
+                out[stat] = out.get(stat, 0) + val
+    return out
+
+
+def trait_text(keys, short=False):
+    keys = [k for k in keys if k in TRAITS]
+    if short:
+        return ", ".join(TRAITS[k].name for k in keys)
+    return ", ".join(f"{TRAITS[k].name} ({', '.join(f'{s} {v:+d}' for s, v in TRAITS[k].mods)})"
+                     for k in keys)
+
+
 class Battle:
     def __init__(self, kind, title, players, enemies, attacker, target=None, bonuses=None,
-                 spoils=("", ""), mod_fn=None):
+                 spoils=("", ""), mod_fn=None, field=None):
         configure_field(len(players) + len(enemies))
+        self.plan = field or FieldPlan()
+        self.terrain, self.structs = self.plan.generate()
         self.kind, self.title, self.attacker, self.target = kind, title, attacker, target
         self.defender = other(attacker)
         self.spoils = spoils
         self.mod_fn = mod_fn
-        self.max_rounds = MAX_ROUNDS + (10 if COLS > 22 else 0) + (10 if COLS > 28 else 0)
+        self.max_rounds = (MAX_ROUNDS + (10 if COLS > 22 else 0) + (10 if COLS > 28 else 0)
+                           + (10 if self.structs else 0))
         self.units = players + enemies
         self.occ = {}
         self.version = 0
@@ -2119,7 +2478,14 @@ class Battle:
         self.shots, self.strikes, self.floaters, self.blasts = [], {}, [], []
         self.pending_sounds = []
         self.instant = False
-        self.log = [(f"The armies deploy: {len(players)} against {len(enemies)}.", C["paper"])]
+        self.new_traits = []
+        self.log = [(f"The armies deploy: {len(players)} against {len(enemies)}.", C["paper"]),
+                    (f"{self.plan.profile_name}. {self.plan.profile_note}", C["muted"])]
+        if self.structs:
+            whose = "Your" if self.plan.holder == "player" else "Enemy"
+            self.log.append((f"{whose} fortifications bar the way. Break them down or go around.",
+                             C["stone"]))
+
         self.round_notes, self.round_slain = [], []
         self.round_hits = self.round_heals = self.round_blocks = 0
         self.round_flags = set()
@@ -2148,7 +2514,7 @@ class Battle:
                     [(c, r) for c in range(COLS // 2 - 1) for r in order]
             for c, r in spots:
                 gx = c if team == "player" else COLS - 1 - c
-                if (gx, r) not in self.occ:
+                if self.open_tile((gx, r), u):
                     u.gx, u.gy = gx, r
                     self.occ[(gx, r)] = u
                     break
@@ -2221,8 +2587,107 @@ class Battle:
         u.gx, u.gy = pos
         self.occ[pos] = u
 
-    def free(self, p):
-        return 0 <= p[0] < COLS and 0 <= p[1] < ROWS and p not in self.occ
+    def free(self, p, u=None):
+        return self.open_tile(p, u)
+
+    def open_tile(self, p, u=None):
+        """Can a unit stand here? Walls, boulders and deep water say no."""
+        if not (0 <= p[0] < COLS and 0 <= p[1] < ROWS) or p in self.occ:
+            return False
+        s = self.structs.get(p)
+        if s is not None and s.alive:
+            return False
+        kind = self.terrain.get(p)
+        if kind == "rock":
+            return False
+        if kind == "water":
+            return u is not None and "flying" in u.t.tags
+        return True
+
+    def terr_at(self, pos):
+        return self.terrain.get(pos, "plain")
+
+    def move_cost(self, u, p):
+        if "flying" in u.t.tags:
+            return 1
+        return TERRAIN[self.terr_at(p)]["cost"]
+
+    def terrain_def(self, u):
+        return TERRAIN[self.terr_at(u.pos)]["def"] + self.fort_bonus(u)
+
+    def terrain_att(self, u):
+        return TERRAIN[self.terr_at(u.pos)]["att"]
+
+    def fort_bonus(self, u):
+        """Fighting with your own wall at your back is worth something."""
+        best = 0
+        for dx, dy in DIRS:
+            s = self.structs.get((u.gx + dx, u.gy + dy))
+            if s is not None and s.alive and s.team == u.team:
+                best = max(best, s.def_bonus)
+        return best
+
+    def los(self, a, d):
+        """(clear shot?, cover penalty) from one unit to another."""
+        cover = TERRAIN[self.terr_at(d.pos)]["cover"]
+        blocking = 0
+        for p in tiles_between(a.pos, d.pos):
+            kind = self.terr_at(p)
+            if kind in SIGHT_BLOCK:
+                return False, 0
+            s = self.structs.get(p)
+            if s is not None and s.alive:
+                blocking = max(blocking, 2 + s.def_bonus)
+            blocking = max(blocking, TERRAIN[kind]["cover"])
+        return True, min(6, cover + blocking)
+
+    def struct_target(self, u, rng=1):
+        """The nearest live enemy fortification within reach."""
+        best, best_d = None, 1 << 30
+        for s in self.structs.values():
+            if not s.alive or s.team == u.team:
+                continue
+            d = max(abs(s.pos[0] - u.gx), abs(s.pos[1] - u.gy))
+            if d <= rng and d < best_d:
+                best, best_d = s, d
+        return best
+
+    def break_struct(self, s):
+        self.structs.pop(s.pos, None)
+        self.terrain[s.pos] = "rubble"
+        self.note(f"The {s.name.lower()} is broken down!", C["gold"])
+        self.round_flags.add("boulder")
+
+    def hurt_struct(self, u, s, dmg):
+        dmg = max(1, int(dmg))
+        s.hp = max(0, s.hp - dmg)
+        self.strikes[u.uid] = tile_center(*s.pos)
+        x, y = tile_center(*s.pos)
+        if not self.instant:
+            self.floaters.append({"x": x, "y": y - TILE * 0.35, "label": str(dmg), "color": C["stone"],
+                                  "delay": ROUND_TIME * 0.4, "age": 0.0, "action": None, "numeric": True})
+        if not s.alive:
+            self.break_struct(s)
+
+    def hit_struct(self, u, s):
+        """Hack at a wall with everything that can reach it."""
+        total = 0
+        for w in u.t.weapons:
+            if w.rng and "siege" not in u.t.tags:
+                continue
+            dmg = w.dmg + u.dmg_bonus
+            if "siege" in u.t.tags or "area" in w.tags:
+                dmg *= 3
+            elif w.dmg <= 2:
+                dmg = max(1, dmg // 2)          # fists and daggers barely scratch timber
+            total += dmg
+        self.hurt_struct(u, s, total or 1)
+
+    def shoot_struct(self, u, s, idx):
+        w = u.t.weapons[idx]
+        u.ammo[idx] -= 1
+        self.shot(u, s.pos, "boulder" if "area" in w.tags else "arrow")
+        self.hurt_struct(u, s, (w.dmg + u.dmg_bonus) * 3)
 
     # ---- effects ---------------------------------------------------------
     def note(self, msg, color=None):
@@ -2334,6 +2799,8 @@ class Battle:
                 a.xp += 3
                 a.stats["kills"] += 1
                 a.kills_total += 1
+                if d.t.tier >= a.t.tier + 2 or (d.t.tier >= 3 and d.t.tier > a.t.tier):
+                    a.stats["great"] += 1
             self.round_slain.append(f"{self.side_name(d.team)} {d.t.name}" + (" (poison)" if source == "Poison" else ""))
             if d.team == "player" and not d.summoned and "static" not in d.t.tags:
                 self.fallen.append(d)
@@ -2369,8 +2836,9 @@ class Battle:
 
     def strike(self, a, d, w, charge=False):
         harass = max(0, len(self.adjacent_foes(d)) - 1)
-        defense = d.defense - harass - (4 if d.state == "rout" else 0) + (2 if self.guarded(d) else 0)
-        if a.att + w.att + drn() <= defense + drn():
+        defense = (d.defense + self.terrain_def(d) - harass - (4 if d.state == "rout" else 0)
+                   + (2 if self.guarded(d) else 0))
+        if a.att + w.att + self.terrain_att(a) + drn() <= defense + drn():
             return 0
         a.stats["hits"] += 1
         bonus = (3 if charge else 0) + (5 if "anti_mount" in w.tags and d.t.mounted else 0)
@@ -2387,6 +2855,8 @@ class Battle:
         if reach_only:
             weapons = [w for w in weapons if w.reach > 1]
         charging = moved and any("charge" in w.tags for w in weapons)
+        if self.terr_at(a.pos) in NO_CHARGE or self.terr_at(d.pos) in NO_CHARGE:
+            charging = False            # no room to build up a charge in cover
         if charging and cheb(a, d) == 1 and d.state == "fight":
             repel = [w for w in d.t.weapons if "repel" in w.tags]
             if repel and self.strike(d, a, repel[0]) > 0:
@@ -2421,7 +2891,9 @@ class Battle:
         ap = "ap" in w.tags or (a.b_ranged_ap and "thrown" not in w.tags)
         kw = dict(ap=ap, an="an" in w.tags, magic="magic" in w.tags, source=w.name)
         style = "fire" if "magic" in w.tags else ("boulder" if "area" in w.tags else "arrow")
-        hit = a.att + w.att + drn() - dist // 3 > 6 + d.defense // 3 + drn()
+        _, cover = self.los(a, d)
+        hit = (a.att + w.att + self.terrain_att(a) + drn() - dist // 3
+               > 6 + d.defense // 3 + cover + drn())
         if "area" in w.tags:
             center = d.pos if hit else (d.gx + random.randint(-2, 2), d.gy + random.randint(-2, 2))
             self.shot(a, center, style)
@@ -2464,7 +2936,7 @@ class Battle:
             dy = abs(f.gy - uy)
             if dy > d:
                 d = dy
-            if min_rng <= d <= rng:
+            if min_rng <= d <= rng and self.los(u, f)[0]:
                 foes.append((d, f))
         if prefer:
             preferred = [df for df in foes if prefer(df[1])]
@@ -2660,18 +3132,23 @@ class Battle:
         return True
 
     # ---- movement ----------------------------------------------------------
-    def step_toward(self, u, goal):
+    def best_step(self, u, goal):
         best, best_key = None, (cheb(u, goal), math.hypot(u.gx - goal.gx, u.gy - goal.gy))
         for dx, dy in DIRS:
             p = (u.gx + dx, u.gy + dy)
-            if not self.free(p):
+            if not self.open_tile(p, u):
                 continue
             key = (max(abs(p[0] - goal.gx), abs(p[1] - goal.gy)), math.hypot(p[0] - goal.gx, p[1] - goal.gy))
             if key < best_key:
                 best, best_key = p, key
-        if best is None:
+        return best
+
+    def step_toward(self, u, goal):
+        p = self.best_step(u, goal)
+        if p is None:
             return False
-        self.move_to(u, best)
+        self.move_to(u, p)
+        u.stats["steps"] += 1
         return True
 
     def fly_toward(self, u, goal, stop_range):
@@ -2683,7 +3160,7 @@ class Battle:
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
                 p = (u.gx + dx, u.gy + dy)
-                if (dx or dy) and self.free(p):
+                if (dx or dy) and self.open_tile(p, u):
                     k = key(p)
                     if k < best_key:
                         best, best_key = p, k
@@ -2713,9 +3190,17 @@ class Battle:
         if "flying" in u.t.tags:
             return self.fly_toward(u, goal, stop_range)
         moved = False
-        for _ in range(u.move):
-            if cheb(u, goal) <= stop_range or not self.step_toward(u, goal):
+        budget = u.move
+        while budget > 0 and cheb(u, goal) > stop_range:
+            p = self.best_step(u, goal)
+            if p is None:
                 break
+            cost = self.move_cost(u, p)
+            if cost > budget and moved:
+                break                   # heavy ground eats the rest of the move
+            budget -= max(1, cost)
+            self.move_to(u, p)
+            u.stats["steps"] += 1
             moved = True
         return moved
 
@@ -2726,7 +3211,7 @@ class Battle:
                 break
             for ddy in random.sample([0, -1, 1], 3):
                 p = (u.gx + dx, u.gy + ddy)
-                if self.free(p):
+                if self.open_tile(p, u):
                     self.move_to(u, p)
                     break
         if u.gx == edge:
@@ -2738,7 +3223,7 @@ class Battle:
             best, best_d = None, here
             for dx, dy in DIRS:
                 p = (u.gx + dx, u.gy + dy)
-                if not self.free(p):
+                if not self.open_tile(p, u):
                     continue
                 dd = min(max(abs(p[0] - f.gx), abs(p[1] - f.gy)) for f in foes)
                 if dd > best_d:
@@ -2794,6 +3279,13 @@ class Battle:
                 if u.reload > 0:
                     u.reload -= 1
                     return
+                if "siege" in t.tags:
+                    s = self.struct_target(u, rng)
+                    if s is not None:
+                        self.shoot_struct(u, s, idx)
+                        if "reload" in w.tags:
+                            u.reload = 1
+                        return
                 d = self.pick_target(u, rng, min_rng=min_rng)
                 if d is not None:
                     self.shoot(u, d, idx)
@@ -2814,6 +3306,10 @@ class Battle:
             if far:
                 self.melee(u, min(far, key=lambda f: f.hp), reach_only=True)
                 return
+        blocking = self.struct_target(u, 1)
+        if blocking is not None:
+            self.hit_struct(u, blocking)
+            return
         ti, tw = self.ranged_weapon(u, thrown=True)
         if tw is not None:
             d = self.pick_target(u, tw.rng, min_rng=2)
@@ -2938,10 +3434,52 @@ class Battle:
             u.battles += 1
         self.promotions = [u for u in self.units if u.team == "player" and u.state != "dead"
                            and not u.summoned and u.rank > u.start_rank]
+        for u in self.units:
+            if u.team != "player" or u.summoned or "static" in u.t.tags:
+                continue
+            got = self.award_trait(u)
+            if got:
+                self.new_traits.append((u,) + got)
         if not self.instant:
             SOUND.play("victory" if self.result == "player" else "defeat")
             if self.promotions:
                 self.pending_sounds.append([1.2, "promote"])
+
+    def award_trait(self, u):
+        """What a soldier carries away from the battle besides experience."""
+        if u.state == "dead":
+            return None
+        won = self.result == "player"
+        if u.state == "fled":
+            # a rout does not scar everyone who runs, or one bad day would mark a whole army
+            return ("gain", "shaken") if random.random() < 0.35 and u.add_trait("shaken") else None
+        if won and u.state == "fight" and u.drop_trait("shaken"):
+            return ("cure", "shaken")
+        st = u.stats
+        battered = u.hp * 5 <= u.max_hp
+        earned = []
+        if st["great"]:
+            earned.append("slayer")
+        if won and self.lost_frac("player") >= 0.5:
+            earned.append("stalwart")
+        if battered:
+            earned.append("scarred")
+        if st["kills"] >= 5:
+            earned.append("bloodthirsty")
+        if st["taken"] >= 30:
+            earned.append("hardened")
+        if st["hits"] >= 6 and any(w.rng for w in u.t.weapons):
+            earned.append("marksman")
+        if st["spells"] >= 8:
+            earned.append("adept")
+        if st["steps"] >= 18:
+            earned.append("swift")
+        for key in earned:
+            if u.add_trait(key):
+                return ("gain", key)
+        if battered and random.random() < 0.1 and u.add_trait("lamed"):
+            return ("gain", "lamed")
+        return None
 
     def skip(self):
         for f in self.floaters:
@@ -3071,8 +3609,19 @@ class Battle:
                     col = mix(col, C["blue"], 0.08)
                 elif gx >= COLS - 2:
                     col = mix(col, C["red"], 0.08)
-                gfx.rect(surf, col, (FIELD_X + gx * TILE, FIELD_Y + gy * TILE, TILE, TILE))
+                kind = self.terrain.get((gx, gy))
+                if kind:
+                    tint = TERRAIN[kind]["tint"]
+                    if tint:
+                        col = mix(col, tint[0], tint[1])
+                rect = (FIELD_X + gx * TILE, FIELD_Y + gy * TILE, TILE, TILE)
+                gfx.rect(surf, col, rect)
+                if kind and kind != "plain":
+                    draw_terrain(surf, kind, rect, gx * 31 + gy * 17, col)
         gfx.rect(surf, C["edge"], (FIELD_X - 2, FIELD_Y - 2, COLS * TILE + 4, ROWS * TILE + 4), 2)
+        for s in self.structs.values():
+            if s.alive:
+                draw_struct(surf, s, tile_center(*s.pos))
 
         scale = TILE / 54
         cs = max(4, int(9 * scale))
@@ -3171,6 +3720,23 @@ class Battle:
             status.insert(0, "FLEEING")
         if status:
             lines.append((", ".join(status), "smallb", C["gold"]))
+        if u.traits:
+            lines.append(("Traits: " + trait_text(u.traits, short=True), "small", C["gold"]))
+        kind = self.terr_at(u.pos)
+        info = TERRAIN[kind]
+        fort = self.fort_bonus(u)
+        if kind != "plain" or fort:
+            bits = []
+            if info["att"]:
+                bits.append(f"att {info['att']:+d}")
+            if info["def"]:
+                bits.append(f"def {info['def']:+d}")
+            if info["cover"]:
+                bits.append(f"cover {info['cover']}")
+            if fort:
+                bits.append(f"sheltered by the wall (def +{fort})")
+            lines.append((f"Ground: {info['name']}" + ("  ·  " + "; ".join(bits) if bits else ""),
+                          "small", C["stone"]))
         if u.stats["dmg"] or u.stats["kills"] or u.stats["healed"]:
             lines.append((f"This battle: {u.stats['kills']} kills, {u.stats['dmg']} damage"
                           + (f", {u.stats['healed']} healed" if u.stats["healed"] else ""), "small", C["muted"]))
@@ -3416,6 +3982,21 @@ class Battle:
             y += 19
         if not self.promotions:
             text(surf, "No promotions this time.", (rx, y), "small", C["muted"])
+            y += 19
+        y += 18
+        text(surf, f"Traits earned ({len(self.new_traits)})", (rx, y), "head", C["gold"])
+        y += 32
+        if not self.new_traits:
+            text(surf, "Nobody was marked by this battle.", (rx, y), "small", C["muted"])
+        for u, how, key in self.new_traits[:12]:
+            tr = TRAITS[key]
+            text(surf, fit(u.name or u.t.name, "small", 150), (rx, y), "small")
+            if how == "cure":
+                text(surf, f"shakes off {tr.name}", (rx + 160, y), "small", C["green"])
+            else:
+                text(surf, tr.name, (rx + 160, y), "smallb", C["gold"] if tr.good else C["red"])
+                text(surf, ", ".join(f"{s} {v:+d}" for s, v in tr.mods), (rx + 280, y), "small", C["muted"])
+            y += 19
 
 
 # --------------------------------------------------------------------------
@@ -3706,6 +4287,8 @@ class Game:
         def clone(s):
             c = Soldier(s.t.key, s.team, s.xp, named=False)
             c.bonus_hp = s.bonus_hp
+            c.traits = list(s.traits)
+            c.reset_for_battle()
             c.hp = min(s.hp, c.max_hp)
             return c
         players = [clone(s) for s in self.available()]
@@ -3713,6 +4296,7 @@ class Game:
         for u in enemies:
             u.hp = u.max_hp
         b = Battle("attack", "sim", players, enemies, attacker="player", bonuses=t.bonuses(),
+                   field=t.field_plan(),
                    mod_fn=self.unit_mods)
         b.instant = True
         while not b.result:
@@ -3747,7 +4331,7 @@ class Game:
         lose = f"The survivors of {target.name} will heal and hold against your next attempt."
         self.battle = Battle("attack", f"Assault on {target.name}", self.available(), target.garrison,
                              attacker="player", target=target, bonuses=target.bonuses(),
-                             spoils=(win, lose), mod_fn=self.unit_mods)
+                             spoils=(win, lose), mod_fn=self.unit_mods, field=target.field_plan())
         self.scene = "battle"
         SOUND.play("march")
 
@@ -3786,9 +4370,11 @@ class Game:
         bonuses = {"enemy": region_stats(self.region_no - 1)}
         if walls:
             bonuses["player"] = {"def": walls}
+        plan = FieldPlan(self.region.home_ground, seed=self.seed * 13 + self.raid_count * 97,
+                         walls=walls, holder="player")
         self.battle = Battle("defense", f"{faction} raid on your town", defenders + towers, enemies,
                              attacker="enemy", bonuses=bonuses,
-                             spoils=spoils, mod_fn=self.unit_mods)
+                             spoils=spoils, mod_fn=self.unit_mods, field=plan)
         self.pending_loot = loot
         self.scene = "battle"
         SOUND.play("horn")
@@ -4500,6 +5086,14 @@ class Game:
                 text(surf, f"Win chance ≈ {int(round(pct * 100))}%  ·  {verdict}", (x, y), "bold", vcol)
                 text(surf, f"{n} test battles", (rect.right - 14, y + 2), "small", C["muted"], right=True)
             y += 26
+            ground = FIELD_PROFILES.get(t.ground, FIELD_PROFILES["plains"])
+            text(surf, f"Ground: {ground[0]}" + (f"  ·  walls +{t.walls}" if t.walls else ""),
+                 (x, y), "smallb", C["stone"])
+            y += 18
+            for line in wrap(ground[1], "small", 380)[:2]:
+                text(surf, line, (x, y), "small", C["muted"])
+                y += 16
+            y += 4
             text(surf, f"Garrison: {len(t.garrison)} (grows to {t.cap})", (x, y), "bold")
             y += 22
             groups = sorted(t.grouped().items(), key=lambda kv: (-UNITS[kv[0]].tier, -len(kv[1])))
@@ -4631,6 +5225,19 @@ HELP_PAGES = [
         "Your Captain inspires your army. If the Captain falls, morale suffers and they need time to recover.",
         "Battles end when one side is gone, or at nightfall, when the attackers withdraw.",
         "Bigger fights get a bigger battlefield automatically.",
+    ]),
+    ("Ground, walls and traits", [
+        "Every site is fought over its own ground, named on the war map before you march. Forest gives cover "
+        "from arrows and leaves no room to charge. High ground is worth +1 attack and defence. Marsh is slow "
+        "and leaves waders exposed. Boulders and deep water stop everything but fliers.",
+        "Fortified sites put a wall line between you and the garrison, with a gate and towers. Defenders "
+        "beside their own wall are harder to hit. Break a section down, storm the gate, or fly over.",
+        "Siege engines tear through walls three times as fast as anything else. Your own Town Walls stand "
+        "on the field when raiders come.",
+        "Soldiers who live through something remarkable carry it for good: cut down four foes, kill something "
+        "far above your weight, hold the line while the army breaks, or walk off a near-fatal wound, and they "
+        "gain a trait. Run from the field and they carry Shaken until they win a battle without fleeing.",
+        "Three traits is as many as anyone carries. The Chronicle (H) lists who has what.",
     ]),
     ("Weapons and traits", [
         "Reach: hits from two tiles away.  Charge: only when the unit moved this round.",
@@ -5139,7 +5746,7 @@ class App:
             return
         if self.chron_tab == "Warband":
             heads = [("Name", 0), ("Unit", 170), ("Tier", 350), ("Rank", 410), ("XP", 510), ("Kills", 570),
-                     ("Battles", 640), ("HP", 720), ("Status", 820)]
+                     ("Battles", 640), ("HP", 720), ("Status", 820), ("Traits", 920)]
             rows = sorted(g.army, key=lambda v: (-v.xp, -v.t.tier))
         else:
             heads = [("Name", 0), ("Unit", 170), ("Tier", 350), ("Rank", 410), ("XP", 510), ("Kills", 570),
@@ -5170,7 +5777,9 @@ class App:
                         (u.kills_total, C["paper"]), (u.battles, C["paper"]),
                         (f"{u.hp}/{u.max_hp}", C["green"] if u.hp == u.max_hp else C["gold"]),
                         ("Recovering" if u is g.captain and g.captain_down > 0 else "Ready",
-                         C["red"] if u is g.captain and g.captain_down > 0 else C["muted"])]
+                         C["red"] if u is g.captain and g.captain_down > 0 else C["muted"]),
+                        (fit(trait_text(u.traits, short=True) or "—", "small", 210),
+                         C["gold"] if any(TRAITS[k].good for k in u.traits) else C["muted"])]
                 tier, rank, t = u.t.tier, u.rank, u.t
             else:
                 d = row
