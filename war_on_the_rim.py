@@ -68,18 +68,314 @@ DIFFICULTY = {
 }
 
 
+# --------------------------------------------------------------------------
+# Sharp rendering at any resolution
+# --------------------------------------------------------------------------
+# The game is laid out on a fixed W x H grid. Rather than drawing at that size
+# and stretching the finished picture to fill the screen (which is what made
+# fullscreen blurry), every draw call is scaled and done at the real screen
+# resolution, and text is rendered with fonts at the matching point size.
+# Game code keeps using W x H coordinates and never needs to know.
+
+RESIZE_EVENTS = tuple(e for e in (getattr(pygame, "VIDEORESIZE", None),
+                                  getattr(pygame, "WINDOWSIZECHANGED", None)) if e is not None)
+MOUSE_EVENTS = (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION)
+_SHADE = {}
+
+
+def make_dpi_aware():
+    """Without this, Windows display scaling (125%, 150%...) stretches the whole window and blurs it."""
+    if os.name != "nt":
+        return
+    os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+class TextImage:
+    """Rendered text: measured in layout units, drawn from a full-resolution surface."""
+    __slots__ = ("img", "w", "h")
+
+    def __init__(self, img, size):
+        self.img = img
+        self.w, self.h = size
+
+    def get_rect(self, **kw):
+        r = pygame.Rect(0, 0, self.w, self.h)
+        for k, v in kw.items():
+            setattr(r, k, v)
+        return r
+
+    def get_size(self):
+        return self.w, self.h
+
+    def get_width(self):
+        return self.w
+
+    def get_height(self):
+        return self.h
+
+    def set_alpha(self, *args):
+        self.img.set_alpha(*args)
+
+
+class GameFont:
+    """Measures text at the design size (so layout never shifts) but renders it at screen size."""
+
+    def __init__(self, names, pt, bold=False):
+        self.names, self.pt, self.bold = names, pt, bold
+        self.base = pygame.font.SysFont(names, pt, bold=bold)
+        self.sharp = self.base
+        self.sharp_pt = pt
+
+    def set_scale(self, k):
+        pt = max(1, round(self.pt * k))
+        if pt != self.sharp_pt:
+            self.sharp_pt = pt
+            self.sharp = self.base if pt == self.pt else pygame.font.SysFont(self.names, pt, bold=self.bold)
+
+    def size(self, s):
+        return self.base.size(s)
+
+    def render(self, s, antialias, color, background=None):
+        if background is None:
+            img = self.sharp.render(s, antialias, color)
+        else:
+            img = self.sharp.render(s, antialias, color, background)
+        return TextImage(img, self.base.size(s))
+
+
+class Canvas:
+    """A drawing target in layout units, backed by a real surface k times larger."""
+
+    def __init__(self, surf, k, size):
+        self.surf, self.k, self.size = surf, k, (int(size[0]), int(size[1]))
+        self.clip = None
+
+    # -- unit conversion ------------------------------------------------------
+    def r(self, rect):
+        if self.k == 1:
+            return rect
+        if len(rect) == 2:
+            (x, y), (w, h) = rect
+        else:
+            x, y, w, h = rect
+        k = self.k
+        x0, y0 = round(x * k), round(y * k)
+        return pygame.Rect(x0, y0, round((x + w) * k) - x0, round((y + h) * k) - y0)
+
+    def p(self, pt):
+        return pt if self.k == 1 else (pt[0] * self.k, pt[1] * self.k)
+
+    def ps(self, pts):
+        return pts if self.k == 1 else [(x * self.k, y * self.k) for x, y in pts]
+
+    def n(self, v):
+        """Scale a length (radius, corner) keeping zero and negatives as they are."""
+        return v if self.k == 1 or v <= 0 else max(1, round(v * self.k))
+
+    # -- surface-like API -----------------------------------------------------
+    def fill(self, color, rect=None, special_flags=0):
+        return self.surf.fill(color, None if rect is None else self.r(rect), special_flags)
+
+    def blit(self, src, dest, area=None, special_flags=0):
+        x, y = dest[0], dest[1]
+        k = self.k
+        if isinstance(src, TextImage):
+            img = src.img
+            if k == 1:
+                return self.surf.blit(img, (x, y), area, special_flags)
+            # centre the sharp text on where the design-size text would sit
+            bx = round(x * k + (src.w * k - img.get_width()) / 2)
+            by = round(y * k + (src.h * k - img.get_height()) / 2)
+            return self.surf.blit(img, (bx, by), None, special_flags)
+        if isinstance(src, Canvas):
+            return self.surf.blit(src.surf, (round(x * k), round(y * k)),
+                                  None if area is None else src.r(area), special_flags)
+        if k != 1:  # a plain surface drawn at design size: best effort
+            w, h = src.get_size()
+            src = pygame.transform.smoothscale(src, (max(1, round(w * k)), max(1, round(h * k))))
+        return self.surf.blit(src, (round(x * k), round(y * k)), None, special_flags)
+
+    def subsurface(self, rect):
+        rect = pygame.Rect(rect)
+        return Canvas(self.surf.subsurface(self.r(rect)), self.k, rect.size)
+
+    def set_clip(self, rect):
+        self.clip = None if rect is None else pygame.Rect(rect)
+        self.surf.set_clip(None if rect is None else self.r(self.clip))
+
+    def get_clip(self):
+        return pygame.Rect(self.clip) if self.clip else self.get_rect()
+
+    def get_rect(self, **kw):
+        r = pygame.Rect((0, 0), self.size)
+        for key, v in kw.items():
+            setattr(r, key, v)
+        return r
+
+    def get_size(self):
+        return self.size
+
+    def get_width(self):
+        return self.size[0]
+
+    def get_height(self):
+        return self.size[1]
+
+    def set_alpha(self, *args):
+        self.surf.set_alpha(*args)
+
+
+def make_surface(size, flags=0):
+    k = DISPLAY.k
+    w, h = size
+    return Canvas(pygame.Surface((max(1, round(w * k)), max(1, round(h * k))), flags), k, (w, h))
+
+
+def _radii(c, kw):
+    return {key: c.n(v) for key, v in kw.items()}
+
+
+class gfx:
+    """Drop-in for pygame.draw that understands Canvas targets."""
+
+    @staticmethod
+    def rect(surf, color, rect, width=0, border_radius=0, **kw):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.rect(surf, color, rect, width, border_radius, **kw)
+        return pygame.draw.rect(surf.surf, color, surf.r(rect), surf.n(width),
+                                surf.n(border_radius), **_radii(surf, kw))
+
+    @staticmethod
+    def circle(surf, color, center, radius, width=0, **kw):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.circle(surf, color, center, radius, width, **kw)
+        radius = radius if surf.k == 1 else radius * surf.k
+        return pygame.draw.circle(surf.surf, color, surf.p(center), radius, surf.n(width), **kw)
+
+    @staticmethod
+    def line(surf, color, start, end, width=1):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.line(surf, color, start, end, width)
+        return pygame.draw.line(surf.surf, color, surf.p(start), surf.p(end), surf.n(width))
+
+    @staticmethod
+    def lines(surf, color, closed, points, width=1):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.lines(surf, color, closed, points, width)
+        return pygame.draw.lines(surf.surf, color, closed, surf.ps(points), surf.n(width))
+
+    @staticmethod
+    def polygon(surf, color, points, width=0):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.polygon(surf, color, points, width)
+        return pygame.draw.polygon(surf.surf, color, surf.ps(points), surf.n(width))
+
+    @staticmethod
+    def arc(surf, color, rect, start_angle, stop_angle, width=1):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.arc(surf, color, rect, start_angle, stop_angle, width)
+        return pygame.draw.arc(surf.surf, color, surf.r(rect), start_angle, stop_angle, surf.n(width))
+
+    @staticmethod
+    def ellipse(surf, color, rect, width=0):
+        if not isinstance(surf, Canvas):
+            return pygame.draw.ellipse(surf, color, rect, width)
+        return pygame.draw.ellipse(surf.surf, color, surf.r(rect), surf.n(width))
+
+
+class Display:
+    """Owns the window. Fullscreen uses the monitor's native resolution; the
+    W x H layout is scaled to fit and centred, with black bars if the aspect differs."""
+
+    def __init__(self):
+        self.k = 1.0
+        self.offset = (0, 0)
+        self.bars = []
+        self.canvas = None
+
+    def open(self, size=None):
+        try:
+            if SETTINGS["fullscreen"]:
+                pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            else:
+                pygame.display.set_mode(size or self.windowed_size(), pygame.RESIZABLE)
+        except pygame.error:
+            pygame.display.set_mode((W, H))
+        self.rebuild()
+
+    @staticmethod
+    def windowed_size():
+        try:
+            dw, dh = pygame.display.get_desktop_sizes()[0]
+        except (AttributeError, IndexError, pygame.error):
+            return W, H
+        n = max(1, min((dw - 40) // W, (dh - 100) // H))
+        return W * n, H * n
+
+    def rebuild(self):
+        window = pygame.display.get_surface()
+        if window is None:
+            return
+        dw, dh = window.get_size()
+        k = min(dw / W, dh / H)
+        if k <= 0 or dw < 1 or dh < 1:  # minimised: draw somewhere harmless
+            self.k, self.offset, self.bars = 1.0, (0, 0), []
+            self.canvas = Canvas(pygame.Surface((W, H)), 1.0, (W, H))
+        else:
+            if abs(k - round(k)) < 1e-9:
+                k = float(round(k))
+            vw, vh = min(dw, round(W * k)), min(dh, round(H * k))
+            ox, oy = (dw - vw) // 2, (dh - vh) // 2
+            self.k, self.offset = k, (ox, oy)
+            self.bars = [r for r in (pygame.Rect(0, 0, dw, oy), pygame.Rect(0, oy + vh, dw, dh - oy - vh),
+                                     pygame.Rect(0, oy, ox, vh), pygame.Rect(ox + vw, oy, dw - ox - vw, vh))
+                         if r.w > 0 and r.h > 0]
+            window.fill((0, 0, 0))
+            self.canvas = Canvas(window.subsurface((ox, oy, vw, vh)), k, (W, H))
+        for f in FONTS.values():
+            f.set_scale(self.k)
+        _SHADE.clear()
+
+    def to_layout(self, pos):
+        return (int((pos[0] - self.offset[0]) // self.k), int((pos[1] - self.offset[1]) // self.k))
+
+    def translate(self, event):
+        if event.type in MOUSE_EVENTS and hasattr(event, "pos"):
+            return pygame.event.Event(event.type, dict(event.dict, pos=self.to_layout(event.pos)))
+        return event
+
+    def present(self):
+        window = pygame.display.get_surface()
+        for r in self.bars:
+            window.fill((0, 0, 0), r)
+        pygame.display.flip()
+
+
+DISPLAY = Display()
+
+
 def init_fonts():
     sans, serif = "segoeui,dejavusans,arial", "georgia,dejavuserif,times"
-    FONTS["tiny"] = pygame.font.SysFont(sans, 11)
-    FONTS["tinyb"] = pygame.font.SysFont(sans, 11, bold=True)
-    FONTS["small"] = pygame.font.SysFont(sans, 13)
-    FONTS["smallb"] = pygame.font.SysFont(sans, 13, bold=True)
-    FONTS["body"] = pygame.font.SysFont(sans, 15)
-    FONTS["bold"] = pygame.font.SysFont(sans, 15, bold=True)
-    FONTS["head"] = pygame.font.SysFont(serif, 20, bold=True)
-    FONTS["title"] = pygame.font.SysFont(serif, 26, bold=True)
-    FONTS["big"] = pygame.font.SysFont(serif, 56, bold=True)
-    FONTS["huge"] = pygame.font.SysFont(serif, 84, bold=True)
+    FONTS["tiny"] = GameFont(sans, 11)
+    FONTS["tinyb"] = GameFont(sans, 11, bold=True)
+    FONTS["small"] = GameFont(sans, 13)
+    FONTS["smallb"] = GameFont(sans, 13, bold=True)
+    FONTS["body"] = GameFont(sans, 15)
+    FONTS["bold"] = GameFont(sans, 15, bold=True)
+    FONTS["head"] = GameFont(serif, 20, bold=True)
+    FONTS["title"] = GameFont(serif, 26, bold=True)
+    FONTS["big"] = GameFont(serif, 56, bold=True)
+    FONTS["huge"] = GameFont(serif, 84, bold=True)
+    for f in FONTS.values():
+        f.set_scale(DISPLAY.k)
 
 
 def text(surf, s, pos, font="body", color=None, center=False, right=False):
@@ -1391,9 +1687,9 @@ class Soldier:
 # --------------------------------------------------------------------------
 def draw_glyph(surf, glyph, c, s, col):
     x, y = c
-    L = pygame.draw.line
-    P = pygame.draw.polygon
-    O = pygame.draw.circle
+    L = gfx.line
+    P = gfx.polygon
+    O = gfx.circle
     ink = C["ink"]
     if glyph == "sword":
         L(surf, col, (x - s * .45, y + s * .45), (x + s * .45, y - s * .45), 3)
@@ -1420,7 +1716,7 @@ def draw_glyph(surf, glyph, c, s, col):
         for dx in (-.3, 0, .3):
             L(surf, col, (x + s * dx, y - s * .2), (x + s * dx, y - s * .55), 2)
     elif glyph in ("bow", "hbow"):
-        pygame.draw.arc(surf, col, (x - s * .55, y - s * .55, s * .9, s * 1.1), -1.3, 1.3, 2)
+        gfx.arc(surf, col, (x - s * .55, y - s * .55, s * .9, s * 1.1), -1.3, 1.3, 2)
         L(surf, col, (x - s * .05, y - s * .5), (x - s * .05, y + s * .5), 1)
         if glyph == "hbow":
             P(surf, col, [(x - s * .55, y + s * .55), (x - s * .3, y + s * .2), (x - s * .15, y + s * .55)])
@@ -1431,7 +1727,7 @@ def draw_glyph(surf, glyph, c, s, col):
     elif glyph in ("xbow", "hunter"):
         L(surf, col, (x - s * .5, y - s * .1), (x + s * .5, y - s * .1), 3)
         L(surf, col, (x, y - s * .1), (x, y + s * .55), 3)
-        pygame.draw.arc(surf, col, (x - s * .5, y - s * .45, s, s * .6), 0.2, 2.94, 2)
+        gfx.arc(surf, col, (x - s * .5, y - s * .45, s, s * .6), 0.2, 2.94, 2)
         if glyph == "hunter":
             P(surf, col, [(x - s * .35, y - s * .45), (x + s * .35, y - s * .45), (x, y - s * .7)])
     elif glyph == "lance":
@@ -1458,7 +1754,7 @@ def draw_glyph(surf, glyph, c, s, col):
         L(surf, col, (x - s * .4, y + s * .5), (x + s * .2, y - s * .2), 4)
         O(surf, col, (x + s * .25, y - s * .25), s * .28)
     elif glyph == "sling":
-        pygame.draw.arc(surf, col, (x - s * .5, y - s * .5, s, s), 3.4, 6.0, 2)
+        gfx.arc(surf, col, (x - s * .5, y - s * .5, s, s), 3.4, 6.0, 2)
         O(surf, col, (x + s * .1, y + s * .3), s * .18)
     elif glyph == "fang":
         P(surf, col, [(x - s * .5, y - s * .4), (x - s * .1, y - s * .4), (x - s * .3, y + s * .5)])
@@ -1478,10 +1774,10 @@ def draw_glyph(surf, glyph, c, s, col):
         L(surf, ink, (x - s * .3, y), (x + s * .3, y), 3)
     elif glyph in ("tower", "wall"):
         w = .35 if glyph == "tower" else .55
-        pygame.draw.rect(surf, col, (x - s * w, y - s * .25, s * w * 2, s * .8))
+        gfx.rect(surf, col, (x - s * w, y - s * .25, s * w * 2, s * .8))
         n = 3 if glyph == "tower" else 4
         for i in range(n):
-            pygame.draw.rect(surf, col, (x - s * w + i * s * w * 2 / (n - 0.5), y - s * .5, s * .15, s * .25))
+            gfx.rect(surf, col, (x - s * w + i * s * w * 2 / (n - 0.5), y - s * .5, s * .15, s * .25))
     elif glyph in ("orb", "sun"):
         O(surf, col, (x, y), s * (.25 if glyph == "orb" else .3))
         for a in range(8):
@@ -1505,7 +1801,7 @@ def draw_glyph(surf, glyph, c, s, col):
         P(surf, col, [(x, y - s * .6), (x + s * .35, y - s * .1), (x, y + s * .45), (x - s * .35, y - s * .1)])
         L(surf, ink, (x, y - s * .4), (x, y + s * .55), 2)
     elif glyph in ("tree", "oak"):
-        pygame.draw.rect(surf, col, (x - s * .1, y, s * .2, s * .55))
+        gfx.rect(surf, col, (x - s * .1, y, s * .2, s * .55))
         O(surf, col, (x, y - s * .15), s * .4)
         if glyph == "oak":
             O(surf, col, (x - s * .3, y + s * .05), s * .22)
@@ -1513,21 +1809,21 @@ def draw_glyph(surf, glyph, c, s, col):
     elif glyph == "rune":
         pts = [(x + math.cos(-math.pi / 2 + i * 4 * math.pi / 5) * s * .55,
                 y + math.sin(-math.pi / 2 + i * 4 * math.pi / 5) * s * .55) for i in range(5)]
-        pygame.draw.lines(surf, col, True, pts, 2)
+        gfx.lines(surf, col, True, pts, 2)
     elif glyph in ("rock", "golem"):
         P(surf, col, [(x - s * .5, y + s * .45), (x - s * .4, y - s * .2), (x - s * .05, y - s * .5),
                       (x + s * .4, y - s * .3), (x + s * .5, y + s * .45)])
         if glyph == "golem":
-            pygame.draw.rect(surf, ink, (x - s * .25, y - s * .15, s * .15, s * .1))
-            pygame.draw.rect(surf, ink, (x + s * .1, y - s * .15, s * .15, s * .1))
+            gfx.rect(surf, ink, (x - s * .25, y - s * .15, s * .15, s * .1))
+            gfx.rect(surf, ink, (x + s * .1, y - s * .15, s * .15, s * .1))
         else:
             L(surf, ink, (x - s * .1, y - s * .3), (x + s * .1, y + s * .3), 2)
     elif glyph == "sickle":
-        pygame.draw.arc(surf, col, (x - s * .5, y - s * .55, s * .9, s * .9), 0.3, 3.0, 3)
+        gfx.arc(surf, col, (x - s * .5, y - s * .55, s * .9, s * .9), 0.3, 3.0, 3)
         L(surf, col, (x - s * .05, y - s * .05), (x - s * .3, y + s * .55), 3)
     elif glyph in ("skull", "dknight", "lich"):
         O(surf, col, (x, y - s * .1), s * .38)
-        pygame.draw.rect(surf, col, (x - s * .2, y + s * .15, s * .4, s * .3))
+        gfx.rect(surf, col, (x - s * .2, y + s * .15, s * .4, s * .3))
         O(surf, ink, (x - s * .14, y - s * .1), s * .1)
         O(surf, ink, (x + s * .14, y - s * .1), s * .1)
         if glyph == "dknight":
@@ -1544,7 +1840,7 @@ def draw_glyph(surf, glyph, c, s, col):
         O(surf, ink, (x - s * .14, y - s * .1), s * .08)
         O(surf, ink, (x + s * .14, y - s * .1), s * .08)
     elif glyph == "eye":
-        pygame.draw.ellipse(surf, col, (x - s * .55, y - s * .3, s * 1.1, s * .6), 2)
+        gfx.ellipse(surf, col, (x - s * .55, y - s * .3, s * 1.1, s * .6), 2)
         O(surf, col, (x, y), s * .18)
     elif glyph == "necro":
         L(surf, col, (x - s * .35, y + s * .55), (x - s * .35, y - s * .5), 2)
@@ -1571,12 +1867,12 @@ def draw_glyph(surf, glyph, c, s, col):
             for dy in (-.3, -.1, .1, .3):
                 L(surf, col, (x, y), (x + sgn * s * .6, y + s * dy - s * .1), 2)
     elif glyph == "fist":
-        pygame.draw.rect(surf, col, (x - s * .35, y - s * .3, s * .7, s * .6), border_radius=int(s * .15))
+        gfx.rect(surf, col, (x - s * .35, y - s * .3, s * .7, s * .6), border_radius=int(s * .15))
         for i in range(3):
             L(surf, ink, (x - s * .15 + i * s * .15, y - s * .3), (x - s * .15 + i * s * .15, y), 1)
     elif glyph == "ballista":
         L(surf, col, (x - s * .55, y), (x + s * .55, y), 3)
-        pygame.draw.arc(surf, col, (x - s * .45, y - s * .5, s * .9, s * .8), 0.3, 2.84, 2)
+        gfx.arc(surf, col, (x - s * .45, y - s * .5, s * .9, s * .8), 0.3, 2.84, 2)
         O(surf, col, (x - s * .3, y + s * .4), s * .12)
         O(surf, col, (x + s * .3, y + s * .4), s * .12)
     elif glyph == "catapult":
@@ -1587,11 +1883,11 @@ def draw_glyph(surf, glyph, c, s, col):
         O(surf, col, (x, y), s * .5, 2)
         O(surf, col, (x, y), s * .2)
     elif glyph == "pick":
-        pygame.draw.arc(surf, col, (x - s * .55, y - s * .55, s * 1.1, s * .8), 0.3, 2.84, 3)
+        gfx.arc(surf, col, (x - s * .55, y - s * .55, s * 1.1, s * .8), 0.3, 2.84, 3)
         L(surf, col, (x, y - s * .55), (x, y + s * .55), 3)
     elif glyph == "bed":
         P(surf, col, [(x - s * .55, y), (x, y - s * .5), (x + s * .55, y)], 2)
-        pygame.draw.rect(surf, col, (x - s * .4, y, s * .8, s * .45), 2)
+        gfx.rect(surf, col, (x - s * .4, y, s * .8, s * .45), 2)
     elif glyph == "anvil":
         P(surf, col, [(x - s * .55, y - s * .3), (x + s * .5, y - s * .3), (x + s * .3, y), (x + s * .15, y),
                       (x + s * .25, y + s * .45), (x - s * .25, y + s * .45), (x - s * .15, y), (x - s * .3, y)])
@@ -1601,7 +1897,7 @@ def draw_glyph(surf, glyph, c, s, col):
             L(surf, col, (x, y + s * dy), (x - s * .25, y + s * (dy - .2)), 2)
             L(surf, col, (x, y + s * dy), (x + s * .25, y + s * (dy - .2)), 2)
     elif glyph == "book":
-        pygame.draw.rect(surf, col, (x - s * .45, y - s * .35, s * .9, s * .7), 2)
+        gfx.rect(surf, col, (x - s * .45, y - s * .35, s * .9, s * .7), 2)
         L(surf, col, (x, y - s * .35), (x, y + s * .35), 2)
 
 
@@ -1616,33 +1912,33 @@ def draw_token(surf, t, team, center, hp_frac=1.0, flash=False, routed=False, ra
         body = mix(body, (110, 110, 110), 0.6)
     x, y = center
     if r >= 12:
-        pygame.draw.ellipse(surf, (0, 0, 0), (x - r, y + r - 5, r * 2, 10))
-    pygame.draw.circle(surf, C["ink"], (x, y), r + 2)
-    pygame.draw.circle(surf, body, (x, y), r)
-    pygame.draw.circle(surf, mix(body, C["ink"], 0.35), (x, y), max(1, r - 3))
+        gfx.ellipse(surf, (0, 0, 0), (x - r, y + r - 5, r * 2, 10))
+    gfx.circle(surf, C["ink"], (x, y), r + 2)
+    gfx.circle(surf, body, (x, y), r)
+    gfx.circle(surf, mix(body, C["ink"], 0.35), (x, y), max(1, r - 3))
     draw_glyph(surf, t.glyph, (x, y), r * 1.05, C["paper"])
     if bar:
         bw = r * 2 + 4
-        pygame.draw.rect(surf, (36, 34, 30), (x - bw / 2, y - r - 9, bw, 4))
-        pygame.draw.rect(surf, C["green"] if hp_frac > .4 else C["gold"],
+        gfx.rect(surf, (36, 34, 30), (x - bw / 2, y - r - 9, bw, 4))
+        gfx.rect(surf, C["green"] if hp_frac > .4 else C["gold"],
                          (x - bw / 2, y - r - 9, bw * max(0, min(1, hp_frac)), 4))
         if mana_frac is not None:
-            pygame.draw.rect(surf, (30, 34, 48), (x - bw / 2, y - r - 5, bw, 2))
-            pygame.draw.rect(surf, C["mana"], (x - bw / 2, y - r - 5, bw * max(0, min(1, mana_frac)), 2))
+            gfx.rect(surf, (30, 34, 48), (x - bw / 2, y - r - 5, bw, 2))
+            gfx.rect(surf, C["mana"], (x - bw / 2, y - r - 5, bw * max(0, min(1, mana_frac)), 2))
     for i in range(rank):
         px = x - (rank - 1) * 4 + i * 8
-        pygame.draw.polygon(surf, RANK_COLORS[rank], [(px - 3, y + r - 1), (px, y + r + 3), (px + 3, y + r - 1)])
+        gfx.polygon(surf, RANK_COLORS[rank], [(px - 3, y + r - 1), (px, y + r + 3), (px + 3, y + r - 1)])
     if tier:
         tier_badge(surf, t.tier, (x - r - 2, y - r - 2))
     if routed:
-        pygame.draw.line(surf, C["paper"], (x + r - 2, y - r), (x + r - 2, y - r - 16), 2)
-        pygame.draw.rect(surf, C["white"], (x + r - 1, y - r - 16, 9, 6))
+        gfx.line(surf, C["paper"], (x + r - 2, y - r), (x + r - 2, y - r - 16), 2)
+        gfx.rect(surf, C["white"], (x + r - 1, y - r - 16, 9, 6))
 
 
 def tier_badge(surf, tier, pos, font="tinyb"):
     img = FONTS[font].render(f"T{tier}", True, C["ink"])
     r = img.get_rect(topleft=pos).inflate(6, 2)
-    pygame.draw.rect(surf, TIER_COLORS[tier], r, border_radius=3)
+    gfx.rect(surf, TIER_COLORS[tier], r, border_radius=3)
     surf.blit(img, img.get_rect(center=r.center))
     return r
 
@@ -1655,20 +1951,24 @@ def draw_glow(surf, pos, radius, color, alpha):
     size = int(radius * 2 + 4)
     if size <= 4:
         return
-    g = pygame.Surface((size, size), pygame.SRCALPHA)
-    pygame.draw.circle(g, (*color, max(0, min(255, int(alpha)))), (size // 2, size // 2), int(radius))
+    g = make_surface((size, size), pygame.SRCALPHA)
+    gfx.circle(g, (*color, max(0, min(255, int(alpha)))), (size // 2, size // 2), int(radius))
     surf.blit(g, (pos[0] - size // 2, pos[1] - size // 2))
 
 
 def shade(surf, alpha=170):
-    s = pygame.Surface((W, H), pygame.SRCALPHA)
+    key = (surf.get_size(), DISPLAY.k)
+    s = _SHADE.get(key)
+    if s is None:
+        _SHADE.clear()
+        s = _SHADE[key] = make_surface(surf.get_size(), pygame.SRCALPHA)
     s.fill((8, 9, 10, alpha))
     surf.blit(s, (0, 0))
 
 
 def panel(surf, rect, border=None, radius=6):
-    pygame.draw.rect(surf, C["panel"], rect, border_radius=radius)
-    pygame.draw.rect(surf, border or C["edge"], rect, 1 if border is None else 2, border_radius=radius)
+    gfx.rect(surf, C["panel"], rect, border_radius=radius)
+    gfx.rect(surf, border or C["edge"], rect, 1 if border is None else 2, border_radius=radius)
 
 
 def cost_parts(surf, x, y, gold, iron=0, essence=0, font="small", have=None):
@@ -1704,8 +2004,8 @@ class UI:
             bg, fg, edge = (132, 98, 40) if hover else (110, 80, 34), C["white"], C["gold"]
         else:
             bg, fg, edge = (66, 72, 80) if hover else (52, 57, 64), C["paper"], (90, 96, 104)
-        pygame.draw.rect(surf, bg, rect, border_radius=4)
-        pygame.draw.rect(surf, edge, rect, 1, border_radius=4)
+        gfx.rect(surf, bg, rect, border_radius=4)
+        gfx.rect(surf, edge, rect, 1, border_radius=4)
         text(surf, fit(label, font, rect.w - 8), rect.center, font, fg, center=True)
         if enabled:
             self.buttons.append((rect, cb))
@@ -1717,8 +2017,8 @@ class UI:
             on = lab == current
             hover = r.collidepoint(self.mouse)
             bg = (92, 72, 36) if on else ((62, 66, 72) if hover else (44, 48, 54))
-            pygame.draw.rect(surf, bg, r, border_radius=4)
-            pygame.draw.rect(surf, C["gold"] if on else (80, 84, 90), r, 1, border_radius=4)
+            gfx.rect(surf, bg, r, border_radius=4)
+            gfx.rect(surf, C["gold"] if on else (80, 84, 90), r, 1, border_radius=4)
             text(surf, fit(lab, font, w - 6), r.center, font, C["white"] if on else C["paper"], center=True)
             self.buttons.append((r, lambda l=lab: cb(l)))
 
@@ -2735,8 +3035,8 @@ class Battle:
                         pts.append((start[0] + (end[0] - start[0]) * q + random.uniform(-8, 8),
                                     start[1] + (end[1] - start[1]) * q + random.uniform(-8, 8)))
                     pts.append(end)
-                    pygame.draw.lines(surf, C["lightning"], False, pts, 3)
-                    pygame.draw.lines(surf, C["white"], False, pts, 1)
+                    gfx.lines(surf, C["lightning"], False, pts, 3)
+                    gfx.lines(surf, C["white"], False, pts, 1)
                 continue
             q = (self.anim_t - 0.15) / 0.4
             if not 0 <= q <= 1:
@@ -2747,14 +3047,14 @@ class Battle:
             if style == "arrow":
                 dx, dy = end[0] - start[0], end[1] - start[1]
                 d = math.hypot(dx, dy) or 1
-                pygame.draw.line(surf, C["white"], (x - dx / d * 9, y - dy / d * 9), (x, y), 2)
+                gfx.line(surf, C["white"], (x - dx / d * 9, y - dy / d * 9), (x, y), 2)
             elif style == "boulder":
-                pygame.draw.circle(surf, C["stone"], (x, y), 6)
-                pygame.draw.circle(surf, C["ink"], (x, y), 6, 1)
+                gfx.circle(surf, C["stone"], (x, y), 6)
+                gfx.circle(surf, C["ink"], (x, y), 6, 1)
             else:
                 col = C.get(style, C["fire"])
                 draw_glow(surf, (x, y), 10, col, 90)
-                pygame.draw.circle(surf, mix(col, C["white"], 0.4), (x, y), 5)
+                gfx.circle(surf, mix(col, C["white"], 0.4), (x, y), 5)
         for pos, radius, col in self.blasts:
             q = (self.anim_t - 0.45) / 0.45
             if 0 <= q <= 1:
@@ -2771,8 +3071,8 @@ class Battle:
                     col = mix(col, C["blue"], 0.08)
                 elif gx >= COLS - 2:
                     col = mix(col, C["red"], 0.08)
-                pygame.draw.rect(surf, col, (FIELD_X + gx * TILE, FIELD_Y + gy * TILE, TILE, TILE))
-        pygame.draw.rect(surf, C["edge"], (FIELD_X - 2, FIELD_Y - 2, COLS * TILE + 4, ROWS * TILE + 4), 2)
+                gfx.rect(surf, col, (FIELD_X + gx * TILE, FIELD_Y + gy * TILE, TILE, TILE))
+        gfx.rect(surf, C["edge"], (FIELD_X - 2, FIELD_Y - 2, COLS * TILE + 4, ROWS * TILE + 4), 2)
 
         scale = TILE / 54
         cs = max(4, int(9 * scale))
@@ -2781,8 +3081,8 @@ class Battle:
                 x, y = tile_center(u.gx, u.gy)
                 base = C["blue"] if u.team == "player" else (u.t.tint or C["red"])
                 col = mix(base, C["field"], 0.6)
-                pygame.draw.line(surf, col, (x - cs, y - cs), (x + cs, y + cs), 4)
-                pygame.draw.line(surf, col, (x - cs, y + cs), (x + cs, y - cs), 4)
+                gfx.line(surf, col, (x - cs, y - cs), (x + cs, y + cs), 4)
+                gfx.line(surf, col, (x - cs, y + cs), (x + cs, y - cs), 4)
 
         hover = None
         for u in sorted(self.units, key=lambda v: (("flying" in v.t.tags), v.gy)):
@@ -2794,14 +3094,14 @@ class Battle:
             draw_token(surf, u.t, u.team, pos, u.disp_hp / u.max_hp, u.flash > 0,
                        u.state in ("rout", "fled"), radius=r, rank=u.rank, mana_frac=mana)
             if u.slowed:
-                pygame.draw.circle(surf, C["nature"], pos, r + 5, 2)
+                gfx.circle(surf, C["nature"], pos, r + 5, 2)
             if u.poison:
-                pygame.draw.circle(surf, (120, 200, 60), (pos[0] - r, pos[1]), 3)
+                gfx.circle(surf, (120, 200, 60), (pos[0] - r, pos[1]), 3)
             if u.cursed:
-                pygame.draw.circle(surf, C["dark"], (pos[0] - r, pos[1] + r * 0.7), 3)
+                gfx.circle(surf, C["dark"], (pos[0] - r, pos[1] + r * 0.7), 3)
             if u.blessed or u.stoned or u.hasted:
                 col = C["holy"] if u.blessed else (C["stone"] if u.stoned else C["lightning"])
-                pygame.draw.circle(surf, col, (pos[0] + r, pos[1] + r * 0.7), 3)
+                gfx.circle(surf, col, (pos[0] + r, pos[1] + r * 0.7), 3)
             if math.hypot(mouse[0] - pos[0], mouse[1] - pos[1]) < r + 2:
                 hover = u
 
@@ -2814,8 +3114,8 @@ class Battle:
                 img.set_alpha(int(255 * (1 - max(0, a - 0.5) * 2)))
                 surf.blit(img, img.get_rect(center=(f["x"], f["y"] - a * 26)))
 
-        pygame.draw.rect(surf, C["panel"], (0, 0, W, 56))
-        pygame.draw.line(surf, C["edge"], (0, 56), (W, 56), 2)
+        gfx.rect(surf, C["panel"], (0, 0, W, 56))
+        gfx.line(surf, C["edge"], (0, 56), (W, 56), 2)
         text(surf, fit(self.title, "title", 470), (16, 13), "title")
         for team, x, col, label in (("player", 500, C["blue"], "Yours"), ("enemy", 620, C["red"], "Foes")):
             routed = sum(1 for u in self.units if u.team == team and u.state in ("rout", "fled"))
@@ -2834,7 +3134,7 @@ class Battle:
             self.ui.button(surf, (bx + 130, 14, 90, 28), "Menu (Esc)", menu_cb)
 
         ly = FIELD_Y + ROWS * TILE + 6
-        pygame.draw.rect(surf, C["panel"], (0, ly, W, H - ly))
+        gfx.rect(surf, C["panel"], (0, ly, W, H - ly))
         lines = self.log[-4:]
         for i, (line, col) in enumerate(lines):
             text(surf, fit(line, "small", 980), (20, ly + 4 + i * 18), "small",
@@ -2877,8 +3177,8 @@ class Battle:
         bh = 12 + len(lines) * 17
         bw = max(FONTS[f].size(s)[0] for s, f, _ in lines) + 24
         bx, by = min(mouse[0] + 16, W - bw - 6), min(mouse[1] + 16, H - bh - 6)
-        pygame.draw.rect(surf, (18, 20, 22), (bx, by, bw, bh), border_radius=4)
-        pygame.draw.rect(surf, C["edge"], (bx, by, bw, bh), 1, border_radius=4)
+        gfx.rect(surf, (18, 20, 22), (bx, by, bw, bh), border_radius=4)
+        gfx.rect(surf, C["edge"], (bx, by, bw, bh), 1, border_radius=4)
         for i, (s, f, col) in enumerate(lines):
             text(surf, s, (bx + 10, by + 6 + i * 17), f, col)
 
@@ -2905,7 +3205,7 @@ class Battle:
         y += 28
         for name, cx in cols:
             text(surf, name, (x0 + cx, y), "tiny", C["muted"], center=True)
-        pygame.draw.line(surf, C["edge"], (x0, y + 9), (x0 + 450, y + 9))
+        gfx.line(surf, C["edge"], (x0, y + 9), (x0 + 450, y + 9))
         y += 13
         rows = self.team_rows(team)
         totals = {"start": 0, "lost": 0, "fled": 0, "kills": 0, "dmg": 0}
@@ -2931,7 +3231,7 @@ class Battle:
         if len(rows) > max_rows:
             text(surf, f"+{len(rows) - max_rows} more types", (x0 + 22, y + 1), "tiny", C["muted"])
             y += 15
-        pygame.draw.line(surf, C["edge"], (x0, y + 1), (x0 + 450, y + 1))
+        gfx.line(surf, C["edge"], (x0, y + 1), (x0 + 450, y + 1))
         text(surf, "Total", (x0 + 22, y + 4), "bold")
         for (cname, cx), k in zip(cols, ["start", "lost", "fled", "kills", "dmg"]):
             text(surf, totals[k], (x0 + cx, y + 12), "bold", center=True)
@@ -2967,12 +3267,12 @@ class Battle:
         self.ui.tabs(surf, card.x + 30, 114, ["Summary", "Casualties", "Honours"], self.report_tab,
                      lambda t: setattr(self, "report_tab", t), w=130)
         text(surf, "TAB switches pages", (card.right - 30, 121), "tiny", C["dim"], right=True)
-        pygame.draw.line(surf, C["edge"], (card.x + 20, 148), (card.right - 20, 148))
+        gfx.line(surf, C["edge"], (card.x + 20, 148), (card.right - 20, 148))
         body = pygame.Rect(card.x + 30, 158, card.w - 60, card.h - 220)
         {"Summary": self.draw_summary, "Casualties": self.draw_casualties,
          "Honours": self.draw_honours}[self.report_tab](surf, body)
         y = card.bottom - 92
-        pygame.draw.line(surf, C["edge"], (card.x + 20, y), (card.right - 20, y))
+        gfx.line(surf, C["edge"], (card.x + 20, y), (card.right - 20, y))
         outcome = self.spoils[0] if won else self.spoils[1]
         for i, line in enumerate(wrap(outcome, "bold", card.w - 60)[:2]):
             text(surf, line, (card.x + 30, y + 8 + i * 19), "bold", C["gold"] if won else C["red"])
@@ -2983,7 +3283,7 @@ class Battle:
         y1 = self.draw_table(surf, "player", left, body.y, C["blue"], "Your army")
         y2 = self.draw_table(surf, "enemy", right, body.y, C["red"], "The enemy")
         y = max(y1, y2) + 4
-        pygame.draw.line(surf, C["edge"], (body.x - 10, y), (body.right + 10, y))
+        gfx.line(surf, C["edge"], (body.x - 10, y), (body.right + 10, y))
         y += 8
         heal = sum(u.stats["healed"] for u in self.units if u.team == "player")
         eheal = sum(u.stats["healed"] for u in self.units if u.team == "enemy")
@@ -3026,7 +3326,7 @@ class Battle:
         for i, u in enumerate(fallen[:21]):
             yy = y + i * 21
             if i % 2 == 0:
-                pygame.draw.rect(surf, (36, 39, 44), (x0 - 4, yy - 2, 540, 20))
+                gfx.rect(surf, (36, 39, 44), (x0 - 4, yy - 2, 540, 20))
             draw_token(surf, u.t, "player", (x0 + 8, yy + 8), radius=8, bar=False)
             text(surf, fit(f"{u.name} — {u.t.name}", "small", 220), (x0 + 22, yy), "small")
             tier_badge(surf, u.t.tier, (x0 + 252, yy + 2))
@@ -3048,7 +3348,7 @@ class Battle:
         for i in range(len(RANKS)):
             n = sum(1 for u in dead if u.rank == i and not u.summoned)
             rank_text(surf, i, (rx, y), "small")
-            pygame.draw.rect(surf, RANK_COLORS[i], (rx + 80, y + 3, min(250, n * 8), 10))
+            gfx.rect(surf, RANK_COLORS[i], (rx + 80, y + 3, min(250, n * 8), 10))
             text(surf, n, (rx + 90 + min(250, n * 8), y), "small")
             y += 18
         y += 8
@@ -3057,7 +3357,7 @@ class Battle:
         for tier in (1, 2, 3, 4):
             n = sum(1 for u in dead if u.t.tier == tier and not u.summoned)
             tier_badge(surf, tier, (rx + 2, y + 2))
-            pygame.draw.rect(surf, TIER_COLORS[tier], (rx + 80, y + 3, min(250, n * 8), 10))
+            gfx.rect(surf, TIER_COLORS[tier], (rx + 80, y + 3, min(250, n * 8), 10))
             text(surf, n, (rx + 90 + min(250, n * 8), y), "small")
             y += 18
         summ = sum(1 for u in dead if u.summoned)
@@ -3091,7 +3391,7 @@ class Battle:
         for i, u in enumerate(top):
             yy = y + i * 21
             if i % 2 == 0:
-                pygame.draw.rect(surf, (36, 39, 44), (x0 - 4, yy - 2, 570, 20))
+                gfx.rect(surf, (36, 39, 44), (x0 - 4, yy - 2, 570, 20))
             draw_token(surf, u.t, "player", (x0 + 8, yy + 8), radius=8, bar=False)
             col = C["dim"] if u.state == "dead" else C["paper"]
             text(surf, fit(f"{u.name} — {u.t.name}" + (" †" if u.state == "dead" else ""), "small", 190),
@@ -3775,7 +4075,7 @@ class Game:
             img = FONTS["bold"].render(fit(msg, "bold", 760), True, col)
             img.set_alpha(int(255 * min(1, ttl)))
             r = img.get_rect(center=(410, 100 + i * 30))
-            bg = pygame.Surface((r.w + 24, r.h + 8), pygame.SRCALPHA)
+            bg = make_surface((r.w + 24, r.h + 8), pygame.SRCALPHA)
             bg.fill((10, 11, 12, int(215 * min(1, ttl))))
             surf.blit(bg, (r.x - 12, r.y - 4))
             surf.blit(img, r)
@@ -3785,8 +4085,8 @@ class Game:
             self.draw_region_clear(surf)
 
     def draw_topbar(self, surf, menu_cb):
-        pygame.draw.rect(surf, C["panel"], (0, 0, W, 60))
-        pygame.draw.line(surf, C["edge"], (0, 60), (W, 60), 2)
+        gfx.rect(surf, C["panel"], (0, 0, W, 60))
+        gfx.line(surf, C["edge"], (0, 60), (W, 60), 2)
         text(surf, "WAR ON THE RIM", (16, 8), "head", C["gold"])
         mode = "Endless" if self.mode == "endless" else "Campaign"
         text(surf, f"{mode} · {self.difficulty} · {fmt_time(self.time)}", (16, 34), "tiny", C["muted"])
@@ -3804,7 +4104,7 @@ class Game:
         text(surf, "Town", (x, 8), "tiny", C["muted"])
         mi = self.max_integrity()
         for i in range(mi):
-            pygame.draw.rect(surf, C["green"] if i < self.integrity else (60, 50, 44),
+            gfx.rect(surf, C["green"] if i < self.integrity else (60, 50, 44),
                              (x + i * (min(16, 96 // mi)), 28, min(13, 96 // mi - 3), 16), border_radius=2)
         x += 110
         text(surf, f"Region {self.region_no}", (x, 8), "tiny", C["muted"])
@@ -3820,30 +4120,30 @@ class Game:
         self.ui.button(surf, (W - 80, 14, 64, 32), "Menu", menu_cb, font="smallb")
 
     def draw_town(self, surf):
-        pygame.draw.rect(surf, C["grass"], TOWN_RECT, border_radius=6)
+        gfx.rect(surf, C["grass"], TOWN_RECT, border_radius=6)
         rng = random.Random(7)
         for _ in range(140):
             x, y = rng.randint(TOWN_RECT.x + 6, TOWN_RECT.right - 6), rng.randint(TOWN_RECT.y + 6, TOWN_RECT.bottom - 6)
-            pygame.draw.circle(surf, C["grass2"], (x, y), rng.randint(2, 5))
+            gfx.circle(surf, C["grass2"], (x, y), rng.randint(2, 5))
         for p in self.plots:
-            pygame.draw.rect(surf, C["road"], p.rect.inflate(8, 8), border_radius=6)
+            gfx.rect(surf, C["road"], p.rect.inflate(8, 8), border_radius=6)
         for p in self.plots:
             self.draw_plot(surf, p)
         for pe in self.peons:
-            pygame.draw.circle(surf, (210, 190, 150), (int(pe["x"]), int(pe["y"]) - 5), 3)
-            pygame.draw.rect(surf, (120, 90, 60), (int(pe["x"]) - 2, int(pe["y"]) - 2, 5, 6))
-        pygame.draw.rect(surf, C["edge"], TOWN_RECT, 2, border_radius=6)
+            gfx.circle(surf, (210, 190, 150), (int(pe["x"]), int(pe["y"]) - 5), 3)
+            gfx.rect(surf, (120, 90, 60), (int(pe["x"]) - 2, int(pe["y"]) - 2, 5, 6))
+        gfx.rect(surf, C["edge"], TOWN_RECT, 2, border_radius=6)
 
     def draw_plot(self, surf, p):
         sel = p.idx == self.selected
         r = p.rect
         locked = self.plot_locked(p)
-        pygame.draw.rect(surf, (52, 48, 42) if locked else C["dirt"], r, border_radius=5)
+        gfx.rect(surf, (52, 48, 42) if locked else C["dirt"], r, border_radius=5)
         if locked:
             need = 1 + math.ceil((self.plot_rank[p.idx] + 1 - 12) / 3)
             cx, cy = r.center
-            pygame.draw.rect(surf, C["dim"], (cx - 9, cy - 8, 18, 14), border_radius=2)
-            pygame.draw.arc(surf, C["dim"], (cx - 7, cy - 20, 14, 18), 0, math.pi, 2)
+            gfx.rect(surf, C["dim"], (cx - 9, cy - 8, 18, 14), border_radius=2)
+            gfx.arc(surf, C["dim"], (cx - 7, cy - 20, 14, 18), 0, math.pi, 2)
             text(surf, f"Hall Lv{need}", (cx, cy + 20), "tiny", C["dim"], center=True)
         elif p.key is None:
             text(surf, "+", r.center, "title", C["muted"], center=True)
@@ -3855,34 +4155,34 @@ class Game:
             base_y = r.bottom - 22
             body = pygame.Rect(r.centerx - w // 2, base_y - h, w, h)
             col = b.color if p.level else mix(b.color, C["dirt"], 0.55)
-            pygame.draw.ellipse(surf, (40, 34, 26), (body.x - 4, base_y - 5, w + 8, 10))
-            pygame.draw.rect(surf, col, body)
+            gfx.ellipse(surf, (40, 34, 26), (body.x - 4, base_y - 5, w + 8, 10))
+            gfx.rect(surf, col, body)
             roof_h = 12 + lvl * 2
-            pygame.draw.polygon(surf, mix(col, C["ink"], 0.4),
+            gfx.polygon(surf, mix(col, C["ink"], 0.4),
                                 [(body.x - 5, body.y), (body.centerx, body.y - roof_h), (body.right + 5, body.y)])
             if p.key in ("hall", "tower", "walls") and lvl >= 2:
                 for side in (-1, 1):
                     tx = body.centerx + side * (w // 2 - 5)
-                    pygame.draw.rect(surf, mix(col, C["ink"], 0.2), (tx - 5, body.y - 10 - lvl * 2, 10, h + 10 + lvl * 2))
-            pygame.draw.rect(surf, C["ink"], (body.centerx - 4, base_y - 11, 8, 11))
-            pygame.draw.circle(surf, C["ink"], (body.centerx, body.y - roof_h // 2 + 2), 11)
+                    gfx.rect(surf, mix(col, C["ink"], 0.2), (tx - 5, body.y - 10 - lvl * 2, 10, h + 10 + lvl * 2))
+            gfx.rect(surf, C["ink"], (body.centerx - 4, base_y - 11, 8, 11))
+            gfx.circle(surf, C["ink"], (body.centerx, body.y - roof_h // 2 + 2), 11)
             draw_glyph(surf, b.glyph, (body.centerx, body.y - roof_h // 2 + 2), 13, C["paper"])
             if p.building:
                 for i in range(3):
-                    pygame.draw.line(surf, (160, 130, 90), (body.x + i * w // 3, base_y), (body.x + i * w // 3, body.y - 4), 2)
+                    gfx.line(surf, (160, 130, 90), (body.x + i * w // 3, base_y), (body.x + i * w // 3, body.y - 4), 2)
             text(surf, fit(b.name, "tinyb", r.w - 30), (r.x + 5, r.bottom - 15), "tinyb")
             text(surf, f"{p.level}/{b.max_level}", (r.right - 5, r.bottom - 15), "tiny", C["gold"], right=True)
         if p.building:
             prog = 1 - p.building["remaining"] / p.building["total"]
-            pygame.draw.rect(surf, (30, 30, 30), (r.x + 8, r.y + 6, r.w - 16, 6))
-            pygame.draw.rect(surf, C["gold"], (r.x + 8, r.y + 6, (r.w - 16) * prog, 6))
+            gfx.rect(surf, (30, 30, 30), (r.x + 8, r.y + 6, r.w - 16, 6))
+            gfx.rect(surf, C["gold"], (r.x + 8, r.y + 6, (r.w - 16) * prog, 6))
         if p.queue:
             ukey, rem, tot = p.queue[0]
             prog = 1 - rem / tot
-            pygame.draw.rect(surf, (30, 30, 30), (r.x + 8, r.y + 14, r.w - 16, 5))
-            pygame.draw.rect(surf, C["blue"], (r.x + 8, r.y + 14, (r.w - 16) * prog, 5))
+            gfx.rect(surf, (30, 30, 30), (r.x + 8, r.y + 14, r.w - 16, 5))
+            gfx.rect(surf, C["blue"], (r.x + 8, r.y + 14, (r.w - 16) * prog, 5))
             text(surf, f"x{len(p.queue)}", (r.right - 6, r.y + 20), "tinyb", C["blue"], right=True)
-        pygame.draw.rect(surf, C["gold"] if sel else (0, 0, 0), r, 3 if sel else 1, border_radius=5)
+        gfx.rect(surf, C["gold"] if sel else (0, 0, 0), r, 3 if sel else 1, border_radius=5)
 
     def draw_side(self, surf):
         rect = pygame.Rect(812, 72, 448, 474)
@@ -4010,7 +4310,7 @@ class Game:
         text(surf, f"Warband  {len(self.troops())}/{self.army_cap()}", (x, y), "head")
         rx = 250
         for i, (_, name) in enumerate(RANKS):
-            pygame.draw.polygon(surf, RANK_COLORS[i], [(rx, y + 9), (rx + 4, y + 14), (rx + 8, y + 9)])
+            gfx.polygon(surf, RANK_COLORS[i], [(rx, y + 9), (rx + 4, y + 14), (rx + 8, y + 9)])
             r = text(surf, name, (rx + 12, y + 3), "tiny", RANK_COLORS[i])
             rx = r.right + 12
         if self.captain_down > 0:
@@ -4082,36 +4382,36 @@ class Game:
         view.fill(reg.ground)
         rng = random.Random(reg.number * 13)
         for _ in range(180):
-            pygame.draw.circle(view, mix(reg.ground, (0, 0, 0), 0.12),
+            gfx.circle(view, mix(reg.ground, (0, 0, 0), 0.12),
                                (rng.randint(0, MAP_RECT.w), rng.randint(0, MAP_RECT.h)), rng.randint(3, 9))
-        pygame.draw.lines(view, (56, 84, 110), False, reg.river, 9)
-        pygame.draw.lines(view, (74, 108, 140), False, reg.river, 4)
+        gfx.lines(view, (56, 84, 110), False, reg.river, 9)
+        gfx.lines(view, (74, 108, 140), False, reg.river, 4)
         for kind, x, y, s in reg.decor:
             if kind == "forest":
                 for dx, dy in ((-7, 3), (6, 4), (0, -4)):
-                    pygame.draw.polygon(view, (38, 64, 42), [(x + dx, y + dy - 14 * s), (x + dx - 8 * s, y + dy + 6 * s),
+                    gfx.polygon(view, (38, 64, 42), [(x + dx, y + dy - 14 * s), (x + dx - 8 * s, y + dy + 6 * s),
                                                              (x + dx + 8 * s, y + dy + 6 * s)])
             elif kind == "mount":
-                pygame.draw.polygon(view, (98, 92, 84), [(x, y - 24 * s), (x - 22 * s, y + 10 * s), (x + 22 * s, y + 10 * s)])
-                pygame.draw.polygon(view, (200, 198, 190), [(x, y - 24 * s), (x - 6 * s, y - 14 * s), (x + 6 * s, y - 14 * s)])
+                gfx.polygon(view, (98, 92, 84), [(x, y - 24 * s), (x - 22 * s, y + 10 * s), (x + 22 * s, y + 10 * s)])
+                gfx.polygon(view, (200, 198, 190), [(x, y - 24 * s), (x - 6 * s, y - 14 * s), (x + 6 * s, y - 14 * s)])
             elif kind == "hill":
-                pygame.draw.ellipse(view, mix(reg.ground, (140, 130, 90), 0.3), (x - 20 * s, y - 8 * s, 40 * s, 16 * s))
+                gfx.ellipse(view, mix(reg.ground, (140, 130, 90), 0.3), (x - 20 * s, y - 8 * s, 40 * s, 16 * s))
             elif kind == "grave":
-                pygame.draw.rect(view, (120, 116, 124), (x - 4, y - 10, 8, 12), border_radius=3)
-                pygame.draw.line(view, (80, 76, 84), (x - 10, y + 2), (x + 10, y + 2), 2)
+                gfx.rect(view, (120, 116, 124), (x - 4, y - 10, 8, 12), border_radius=3)
+                gfx.line(view, (80, 76, 84), (x - 10, y + 2), (x + 10, y + 2), 2)
             elif kind == "lava":
-                pygame.draw.ellipse(view, (150, 60, 30), (x - 14 * s, y - 5 * s, 28 * s, 10 * s))
-                pygame.draw.ellipse(view, (240, 140, 50), (x - 7 * s, y - 2 * s, 14 * s, 4 * s))
+                gfx.ellipse(view, (150, 60, 30), (x - 14 * s, y - 5 * s, 28 * s, 10 * s))
+                gfx.ellipse(view, (240, 140, 50), (x - 7 * s, y - 2 * s, 14 * s, 4 * s))
         opened = self.open_targets()
         for t in reg.targets:
             srcs = [reg.targets[i].pos for i in t.prereq] if t.prereq else [HOME_POS]
             for src in srcs:
                 a = src
                 on = t in opened or t.conquered
-                pygame.draw.line(view, (150, 130, 90) if on else (84, 76, 60), a, t.pos, 5 if on else 3)
+                gfx.line(view, (150, 130, 90) if on else (84, 76, 60), a, t.pos, 5 if on else 3)
         hx, hy = HOME_POS
-        pygame.draw.circle(view, C["ink"], (hx, hy), 25)
-        pygame.draw.circle(view, C["blue"], (hx, hy), 22)
+        gfx.circle(view, C["ink"], (hx, hy), 25)
+        gfx.circle(view, C["blue"], (hx, hy), 22)
         draw_glyph(view, "banner", (hx, hy), 24, C["paper"])
         text(view, "Home", (hx, hy + 36), "smallb", center=True)
         for t in reg.targets:
@@ -4123,25 +4423,25 @@ class Game:
             col = C["blue"] if t.conquered else FACTIONS[t.faction]["color"]
             if t not in opened and not t.conquered:
                 col = mix(col, (60, 60, 60), 0.5)
-            pygame.draw.circle(view, C["ink"], (x, y), r + 3)
-            pygame.draw.circle(view, col, (x, y), r)
+            gfx.circle(view, C["ink"], (x, y), r + 3)
+            gfx.circle(view, col, (x, y), r)
             glyph = "crown" if t.boss else ("banner" if t.conquered else FACTIONS[t.faction]["glyph"])
             draw_glyph(view, glyph, (x, y), r * 1.1, C["paper"])
             if t.walls and not t.conquered:
                 draw_glyph(view, "wall", (x + r - 2, y - r + 2), 12, C["stone"])
             if t.special and not t.conquered:
-                pygame.draw.circle(view, C["gold"], (x - r + 3, y - r + 3), 5)
+                gfx.circle(view, C["gold"], (x - r + 3, y - r + 3), 5)
             if sel:
-                pygame.draw.circle(view, C["gold"], (x, y), r + 6, 3)
+                gfx.circle(view, C["gold"], (x, y), r + 6, 3)
             below = (t.depth % 2 == 0) or t.boss
             ly = y + r + 14 if below else y - r - 26
             text(view, fit(t.name, "smallb", 130), (x, ly), "smallb", center=True)
             if not t.conquered:
                 text(view, f"{len(t.garrison)} troops", (x, ly + 14), "tiny",
                      C["muted"] if t not in opened else C["paper"], center=True)
-        pygame.draw.rect(surf, C["edge"], MAP_RECT, 2)
+        gfx.rect(surf, C["edge"], MAP_RECT, 2)
         banner = f"Region {reg.number}: {reg.name}"
-        pygame.draw.rect(surf, (18, 20, 22), (MAP_RECT.x + 8, MAP_RECT.y + 8, 330, 26), border_radius=4)
+        gfx.rect(surf, (18, 20, 22), (MAP_RECT.x + 8, MAP_RECT.y + 8, 330, 26), border_radius=4)
         text(surf, banner, (MAP_RECT.x + 16, MAP_RECT.y + 12), "smallb", C["gold"])
 
     def draw_map_panel(self, surf):
@@ -4373,8 +4673,7 @@ def comp_units(tab):
 
 
 class App:
-    def __init__(self, screen):
-        self.screen = screen
+    def __init__(self):
         self.stack = ["menu"]
         self.game = None
         self.ui = UI()
@@ -4415,12 +4714,12 @@ class App:
     def flash(self, msg):
         self.flash_msg = [msg, 2.5]
 
+    @property
+    def screen(self):
+        return DISPLAY.canvas
+
     def apply_display(self):
-        flags = pygame.SCALED | (pygame.FULLSCREEN if SETTINGS["fullscreen"] else 0)
-        try:
-            self.screen = pygame.display.set_mode((W, H), flags)
-        except pygame.error:
-            self.screen = pygame.display.set_mode((W, H))
+        DISPLAY.open()
 
     # ---- flow ------------------------------------------------------------
     def start_new(self):
@@ -4467,6 +4766,8 @@ class App:
     def handle(self, event):
         if event.type == pygame.QUIT:
             self.quit_game()
+        elif event.type in RESIZE_EVENTS:
+            DISPLAY.rebuild()
         elif event.type == pygame.MOUSEWHEEL:
             self.scroll = max(0, self.scroll - event.y * 40)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -4548,17 +4849,17 @@ class App:
             screen_fn(s)
         if self.flash_msg[1] > 0:
             r = text(s, self.flash_msg[0], (W // 2, H - 30), "bold", C["gold"], center=True)
-            pygame.draw.rect(s, C["gold"], r.inflate(20, 10), 1, border_radius=4)
+            gfx.rect(s, C["gold"], r.inflate(20, 10), 1, border_radius=4)
 
     def draw_backdrop(self, s):
         for y in range(0, H, 6):
-            pygame.draw.rect(s, mix((24, 20, 30), (120, 60, 40), (y / H) ** 1.6), (0, y, W, 6))
-        pygame.draw.circle(s, (230, 150, 80), (W - 260, 400), 90)
+            gfx.rect(s, mix((24, 20, 30), (120, 60, 40), (y / H) ** 1.6), (0, y, W, 6))
+        gfx.circle(s, (230, 150, 80), (W - 260, 400), 90)
         for i, pts in enumerate(self.ridges):
             col = mix((40, 30, 36), (14, 12, 16), i / 2)
-            pygame.draw.polygon(s, col, pts + [(W + 40, H), (-20, H)])
+            gfx.polygon(s, col, pts + [(W + 40, H), (-20, H)])
         for x, y, sp in self.embers:
-            pygame.draw.circle(s, (255, 160 + int(sp) % 60, 80), (int(x), int(y)), 2 if sp > 25 else 1)
+            gfx.circle(s, (255, 160 + int(sp) % 60, 80), (int(x), int(y)), 2 if sp > 25 else 1)
 
     def title_block(self, s, title, sub=None, y=70):
         text(s, title, (W // 2, y), "big", C["gold"], center=True)
@@ -4635,8 +4936,8 @@ class App:
         def stepper(key):
             val = SETTINGS[key]
             self.ui.button(s, (x1, y, 36, 32), "-", lambda: self.set_volume(key, -10))
-            pygame.draw.rect(s, (30, 32, 36), (x1 + 44, y + 11, 160, 10), border_radius=4)
-            pygame.draw.rect(s, C["gold"], (x1 + 44, y + 11, 160 * val / 100, 10), border_radius=4)
+            gfx.rect(s, (30, 32, 36), (x1 + 44, y + 11, 160, 10), border_radius=4)
+            gfx.rect(s, C["gold"], (x1 + 44, y + 11, 160 * val / 100, 10), border_radius=4)
             self.ui.button(s, (x1 + 212, y, 36, 32), "+", lambda: self.set_volume(key, 10))
             text(s, f"{val}%", (x1 + 256, y + 8), "bold")
 
@@ -4716,7 +5017,7 @@ class App:
         self.ui.button(s, (card.right - 110, card.y + 12, 90, 32), "Back", self.pop, accent=True)
         units = comp_units(self.comp_tab)
         lst = pygame.Rect(card.x + 16, card.y + 60, 330, card.h - 76)
-        pygame.draw.rect(s, (26, 28, 32), lst, border_radius=4)
+        gfx.rect(s, (26, 28, 32), lst, border_radius=4)
         row_h = 30
         max_scroll = max(0, len(units) * row_h - lst.h)
         self.scroll = min(self.scroll, max_scroll)
@@ -4729,7 +5030,7 @@ class App:
             r = pygame.Rect(lst.x + 4, y, lst.w - 8, row_h - 2)
             sel = u.key == self.comp_sel
             if sel or r.collidepoint(self.ui.mouse):
-                pygame.draw.rect(s, (70, 58, 36) if sel else (44, 48, 54), r, border_radius=3)
+                gfx.rect(s, (70, 58, 36) if sel else (44, 48, 54), r, border_radius=3)
             draw_token(s, u, "enemy" if u.faction not in ("player", "summon") else "player",
                        (r.x + 14, r.centery), radius=11, bar=False)
             text(s, u.name, (r.x + 32, r.y + 6), "bold" if sel else "body")
@@ -4777,7 +5078,7 @@ class App:
                  ("Move", u.move)] + ([("Mana", f"{u.mana} (+{u.regen})")] if u.mana else [])
         for i, (k, v) in enumerate(stats):
             bx = x + i * 110
-            pygame.draw.rect(s, (36, 39, 44), (bx, y, 100, 52), border_radius=4)
+            gfx.rect(s, (36, 39, 44), (bx, y, 100, 52), border_radius=4)
             text(s, k, (bx + 50, y + 13), "small", C["muted"], center=True)
             text(s, v, (bx + 50, y + 35), "head", center=True)
         y += 70
@@ -4853,7 +5154,7 @@ class App:
             if y < lst.y - row_h or y > lst.bottom:
                 continue
             if i % 2 == 0:
-                pygame.draw.rect(s, (36, 39, 44), (lst.x - 4, y, lst.w, row_h - 2))
+                gfx.rect(s, (36, 39, 44), (lst.x - 4, y, lst.w, row_h - 2))
             if self.chron_tab == "Warband":
                 u = row
                 vals = [(u.name, C["paper"]), (u.t.name, C["paper"]), None, None, (u.xp, C["paper"]),
@@ -4902,7 +5203,7 @@ class App:
         for i, (_, name) in enumerate(RANKS):
             n = sum(1 for u in g.army if u.rank == i)
             rank_text(s, i, (rx, y), "bold")
-            pygame.draw.rect(s, RANK_COLORS[i], (rx + 110, y + 4, min(300, n * 10), 12))
+            gfx.rect(s, RANK_COLORS[i], (rx + 110, y + 4, min(300, n * 10), 12))
             text(s, n, (rx + 120 + min(300, n * 10), y), "bold")
             y += 26
         y += 20
@@ -4911,7 +5212,7 @@ class App:
         for i, (_, name) in enumerate(RANKS):
             n = sum(1 for d in g.fallen if d["rank"] == i)
             rank_text(s, i, (rx, y), "bold")
-            pygame.draw.rect(s, RANK_COLORS[i], (rx + 110, y + 4, min(300, n * 10), 12))
+            gfx.rect(s, RANK_COLORS[i], (rx + 110, y + 4, min(300, n * 10), 12))
             text(s, n, (rx + 120 + min(300, n * 10), y), "bold")
             y += 26
 
@@ -4966,28 +5267,26 @@ class App:
 
 
 def main():
+    make_dpi_aware()
     pygame.mixer.pre_init(22050, -16, 1, 512)
     pygame.init()
     pygame.display.set_caption("War on the Rim")
+    DISPLAY.open()
     init_fonts()
-    flags = pygame.SCALED | (pygame.FULLSCREEN if SETTINGS["fullscreen"] else 0)
-    try:
-        screen = pygame.display.set_mode((W, H), flags)
-    except pygame.error:
-        screen = pygame.display.set_mode((W, H))
+    screen = DISPLAY.canvas
     screen.fill(C["bg"])
     text(screen, "Loading...", (W // 2, H // 2), "title", C["gold"], center=True)
-    pygame.display.flip()
+    DISPLAY.present()
     SOUND.init()
     clock = pygame.time.Clock()
-    app = App(screen)
+    app = App()
     while app.running:
         dt = min(clock.tick(FPS) / 1000, 0.05)
         for event in pygame.event.get():
-            app.handle(event)
+            app.handle(DISPLAY.translate(event))
         app.update(dt)
-        app.draw(pygame.mouse.get_pos())
-        pygame.display.flip()
+        app.draw(DISPLAY.to_layout(pygame.mouse.get_pos()))
+        DISPLAY.present()
     pygame.quit()
 
 
